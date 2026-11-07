@@ -8,7 +8,7 @@
 
 **A self-contained PikPak downloader for the terminal.**
 
-One binary, written in Rust: parallel and resumable downloads, no Python, no browser automation, and a download folder that travels with the program.
+Downloads PikPak shared links and drive files in parallel, using the accessible direct streams instead of the browser web UI download limits and barriers.
 
 [![Rust](https://img.shields.io/badge/Rust-2021-6F78A8?logo=rust&logoColor=FFFFFF)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=FFFFFF)](https://github.com/L1m4y/PKdw)
@@ -16,12 +16,6 @@ One binary, written in Rust: parallel and resumable downloads, no Python, no bro
 
 </div>
 
-
-## About
-
-PKdw is focused on one job: turning PikPak shares and drive paths into
-reliable, resumable downloads without a browser. It keeps the command set small,
-reports when a range is unavailable, and never renames an incomplete file.
 
 ## How it works
 
