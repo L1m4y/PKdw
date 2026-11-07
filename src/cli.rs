@@ -49,6 +49,12 @@ pub enum Command {
     /// Show the authenticated account and its quota.
     Whoami,
 
+    /// Run environment and configuration checks.
+    Doctor,
+
+    /// Install a `pkdw` symlink into PATH.
+    Install(InstallArgs),
+
     /// Show paths, device identity, and configuration status.
     Config,
 
@@ -180,6 +186,17 @@ pub struct AuthArgs {
     /// Remove the stored refresh token.
     #[arg(long, conflicts_with_all = ["token", "from_clipboard", "stdin"])]
     pub logout: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    /// Destination directory. Default: ~/.local/bin (or PKDW_BIN_DIR).
+    #[arg(long, value_name = "DIR")]
+    pub to: Option<std::path::PathBuf>,
+
+    /// Replace an existing pkdw entry.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

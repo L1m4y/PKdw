@@ -257,4 +257,4 @@ download. PikPak's terms and local law apply.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GNU General Public License v3.0 or later. See [LICENSE](LICENSE).

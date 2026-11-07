@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A fast, self-contained PikPak CLI downloader written in Rust"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/L1m4y/PKdw"
 default-run = "pkdw"
 
