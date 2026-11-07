@@ -88,22 +88,33 @@ fn read_stdin() -> Result<String> {
     Ok(token)
 }
 
-#[cfg(feature = "clipboard")]
 fn read_clipboard() -> Result<String> {
-    let mut clipboard = arboard::Clipboard::new().context("cannot open the system clipboard")?;
-    let text = clipboard
-        .get_text()
-        .context("the clipboard does not contain text")?;
-    extract_token(&text).ok_or_else(|| anyhow!("no refresh token found in the clipboard"))
-}
+    let mut raw = String::new();
+    // Use the first command that works and returns a non-empty result.
+    let commands = vec![
+        vec!["wl-paste", "-n"],
+        vec!["xclip", "-selection", "clipboard", "-o"],
+        vec!["xsel", "-b"],
+    ];
+    for command in &commands {
+        match std::process::Command::new(command[0])
+            .args(&command[1..])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                raw = String::from_utf8_lossy(&output.stdout).to_string();
+                if !raw.trim().is_empty() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
 
-#[cfg(not(feature = "clipboard"))]
-fn read_clipboard() -> Result<String> {
-    bail!("this build has no clipboard support; use --token or --stdin")
+    extract_token(&raw).ok_or_else(|| {
+        anyhow!("no clipboard text, or no supported clipboard utility (wl-paste, xclip, xsel)")
+    })
 }
-
-/// Accept the token itself, a line containing it, or the browser console
-/// expression that copies it.
 fn extract_token(text: &str) -> Option<String> {
     let mut candidates = Vec::new();
     for line in text.lines() {

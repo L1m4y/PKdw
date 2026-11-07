@@ -31,13 +31,9 @@ sha1 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2"
 
-# Clipboard support is optional at runtime: the binary still builds on systems
-# without an X11/Wayland clipboard provider.
-arboard = { version = "3", optional = true }
-
-[features]
-default = ["clipboard"]
-clipboard = ["arboard"]
+# Clipboard access is done through ordinary system commands (wl-paste, xclip,
+# xsel). PKdw therefore builds on minimal systems and still works without
+# them: pipe the copied token to `pkdw auth --stdin` instead.
 
 [dev-dependencies]
 tempfile = "3"

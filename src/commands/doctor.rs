@@ -147,13 +147,30 @@ pub async fn run(output: &crate::cli::OutputArgs) -> Result<i32> {
         true,
     ));
 
-    let clipboard = cfg!(feature = "clipboard");
+    let clipboard = std::process::Command::new("wl-paste")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        || std::process::Command::new("xclip")
+            .arg("-version")
+            .output()
+            .ok()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        || std::process::Command::new("xsel")
+            .arg("--version")
+            .output()
+            .ok()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
     checks.push((
         "clipboard support",
         if clipboard {
-            "compiled in".to_string()
+            "system tool available".to_string()
         } else {
-            "not compiled (build with --features clipboard)".to_string()
+            "no wl-paste/xclip/xsel found".to_string()
         },
         true,
     ));
