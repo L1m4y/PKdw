@@ -10,16 +10,12 @@
 
 One binary, written in Rust: parallel and resumable downloads, no Python, no browser automation, and a download folder that travels with the program.
 
-[![Rust](https://img.shields.io/badge/Rust-2021-6F78A8?logo=rust&logoColor=000000)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=000000)](https://github.com/L1m4y/PKdw)
+[![Rust](https://img.shields.io/badge/Rust-2021-6F78A8?logo=rust&logoColor=FFFFFF)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=FFFFFF)](https://github.com/L1m4y/PKdw)
+[![License: GPLv3](https://img.shields.io/badge/License-GPLv3-6F78A8?logo=gnu&logoColor=FFFFFF)](LICENSE)
 
 </div>
 
-<div align="right">
-  <a href="LICENSE">
-    <img alt="GPLv3 License" src="https://img.shields.io/badge/License-GPLv3-6F78A8?logo=gnu&logoColor=000000">
-  </a>
-</div>
 
 ## About
 
@@ -110,6 +106,4 @@ Tokens are single-use and rotate on every exchange. PKdw persists each rotation 
 - `docs/API.md` — endpoints, headers, and observed limits.
 - `docs/ARCHITECTURE.md` — modules, portable paths, and the download design.
 
-<div align="center">
-<i>“One command, every range, no missing bytes.”</i>
-</div>
+
