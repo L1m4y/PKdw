@@ -84,6 +84,7 @@ pub async fn share_detail_page(
     share_id: &str,
     parent_id: &str,
     pass_code_token: &str,
+    page_token: Option<&str>,
 ) -> Result<ShareDetailResponse> {
     let mut params = vec![
         ("share_id".to_string(), share_id.to_string()),
@@ -98,6 +99,11 @@ pub async fn share_detail_page(
     ];
     if !parent_id.is_empty() {
         params.push(("parent_id".to_string(), parent_id.to_string()));
+    }
+    if let Some(page_token) = page_token {
+        if !page_token.is_empty() {
+            params.push(("page_token".to_string(), page_token.to_string()));
+        }
     }
     client
         .anon_json::<ShareDetailResponse>("/drive/v1/share/detail", &params)
@@ -164,12 +170,12 @@ async fn walk(
 
     let mut page_token = String::new();
     loop {
-        let page = if page_token.is_empty() {
-            share_detail_page(client, share_id, parent_id, pass_code_token).await?
+        let token = if page_token.is_empty() {
+            None
         } else {
-            share_detail_page_with_token(client, share_id, parent_id, pass_code_token, &page_token)
-                .await?
+            Some(page_token.as_str())
         };
+        let page = share_detail_page(client, share_id, parent_id, pass_code_token, token).await?;
         for entry in page.files {
             if print_tree && !quiet {
                 ui::tree_line(depth, &entry);
@@ -205,34 +211,6 @@ async fn walk(
         }
     }
     Ok(())
-}
-
-async fn share_detail_page_with_token(
-    client: &PikPak,
-    share_id: &str,
-    parent_id: &str,
-    pass_code_token: &str,
-    page_token: &str,
-) -> Result<ShareDetailResponse> {
-    let mut params = vec![
-        ("share_id".to_string(), share_id.to_string()),
-        ("pass_code_token".to_string(), pass_code_token.to_string()),
-        ("thumbnail_size".to_string(), "SIZE_LARGE".to_string()),
-        ("limit".to_string(), "100".to_string()),
-        ("with_audit".to_string(), "true".to_string()),
-        ("page_token".to_string(), page_token.to_string()),
-        (
-            "filters".to_string(),
-            json!({"phase": {"eq": "PHASE_TYPE_COMPLETE"}, "trashed": {"eq": false}}).to_string(),
-        ),
-    ];
-    if !parent_id.is_empty() {
-        params.push(("parent_id".to_string(), parent_id.to_string()));
-    }
-    client
-        .anon_json::<ShareDetailResponse>("/drive/v1/share/detail", &params)
-        .await
-        .context("cannot list the share")
 }
 
 pub async fn file_info(
