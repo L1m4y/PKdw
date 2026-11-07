@@ -1,15 +1,22 @@
-# PKdw
+<p align="center">
+  <img src="assets/icon.png" alt="PKdw logo" width="120">
+</p>
 
-![CI](https://github.com/L1m4y/PKdw/workflows/CI/badge.svg)
-![License](https://img.shields.io/github/license/L1m4y/PKdw)
-![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)
-![Last commit](https://img.shields.io/github/last-commit/L1m4y/PKdw)
+<h1 align="center">PKdw</h1>
 
-PKdw is a self-contained PikPak downloader for the terminal, written in Rust.
+<p align="center">
+  A self-contained PikPak downloader for the terminal, written in Rust.
+</p>
 
-One binary. No Python, no shell dependencies beyond the idioms of this project,
-no browser automation. Downloads are parallel, resumable, and the default
-download directory follows the program wherever it goes.
+<p align="center">
+  <img alt="CI" src="https://github.com/L1m4y/PKdw/workflows/CI/badge.svg">
+  <img alt="GPL-3.0" src="https://img.shields.io/github/license/L1m4y/PKdw?color=6F78A8&labelColor=282F62">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-orange.svg?color=6F78A8&labelColor=282F62">
+</p>
+
+One binary. No Python, no shell dependencies beyond the idioms of this
+project, no browser automation. Downloads are parallel, resumable, and the
+default download directory follows the program wherever it goes.
 
 ## Quick start
 
@@ -116,7 +123,3 @@ may revisit a few boundary segments.
 
 - `docs/API.md` — researched endpoints, headers, and limits.
 - `docs/ARCHITECTURE.md` — modules and download algorithm design.
-
-## License
-
-GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
