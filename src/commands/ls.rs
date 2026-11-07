@@ -1,0 +1,69 @@
+use crate::api::{drive, PikPak};
+use crate::cli::{LsArgs, OutputArgs};
+use crate::ui;
+use anyhow::Result;
+use serde_json::json;
+
+pub async fn run(client: &PikPak, args: &LsArgs, output: &OutputArgs) -> Result<i32> {
+    let target = drive::resolve_path(client, &args.path).await?;
+
+    if !target.is_folder() {
+        if output.json {
+            println!("{}", serde_json::to_string_pretty(&target)?);
+        } else if !output.quiet {
+            ui::drive_line(&target);
+        }
+        return Ok(0);
+    }
+
+    let mut page_token = String::new();
+    let mut entries = Vec::new();
+    loop {
+        let mut params = vec![
+            ("limit".to_string(), args.limit.to_string()),
+            ("thumbnail_size".to_string(), "SIZE_MEDIUM".to_string()),
+        ];
+        if !target.id.is_empty() {
+            params.push(("parent_id".to_string(), target.id.clone()));
+        }
+        if !page_token.is_empty() {
+            params.push(("page_token".to_string(), page_token.clone()));
+        }
+        let page: crate::api::models::DriveListResponse = client
+            .authed_json(reqwest::Method::GET, "/drive/v1/files", &params, None)
+            .await?;
+        entries.extend(page.files);
+        page_token = page.next_page_token;
+        if page_token.is_empty() {
+            break;
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_folder()
+            .cmp(&a.is_folder())
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    if output.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "path": args.path,
+                "entries": entries,
+            }))?
+        );
+        return Ok(0);
+    }
+
+    if !output.quiet {
+        if entries.is_empty() {
+            println!("(empty)");
+        } else {
+            for entry in &entries {
+                ui::drive_line(entry);
+            }
+        }
+    }
+    Ok(0)
+}

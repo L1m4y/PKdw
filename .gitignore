@@ -1,0 +1,16 @@
+/target/
+/downloads/*
+!/downloads/.gitkeep
+
+# Credentials and rotated refresh tokens
+.env
+.env.*
+!.env.example
+
+# Partial downloads and state
+*.part
+*.part.pkdw.json
+*.segs/
+*.log
+
+.DS_Store
