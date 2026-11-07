@@ -10,11 +10,22 @@
 
 One binary, written in Rust: parallel and resumable downloads, no Python, no browser automation, and a download folder that travels with the program.
 
-[![Rust](https://img.shields.io/badge/Rust-2021-282F62?logo=rust&logoColor=FFFFFF)](https://www.rust-lang.org/)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-282F62?logo=gnu&logoColor=FFFFFF)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=FFFFFF)](https://github.com/L1m4y/PKdw)
+[![Rust](https://img.shields.io/badge/Rust-2021-FCC624?logo=rust&logoColor=000000)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=000000)](https://github.com/L1m4y/PKdw)
 
 </div>
+
+<div align="right">
+  <a href="LICENSE">
+    <img alt="GPLv3 License" src="https://img.shields.io/badge/License-GPLv3-FCC624?logo=gnu&logoColor=000000">
+  </a>
+</div>
+
+## About
+
+PKdw is focused on one job: turning PikPak shares and drive paths into
+reliable, resumable downloads without a browser. It keeps the command set small,
+reports when a range is unavailable, and never renames an incomplete file.
 
 ## How it works
 
