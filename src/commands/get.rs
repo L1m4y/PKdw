@@ -56,6 +56,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
             let mut candidates =
                 share_candidates(client, &share_id, &token, file_id.as_deref(), output).await?;
             apply_filters(&mut candidates, args)?;
+            unique_names(&mut candidates);
 
             if candidates.is_empty() {
                 bail!("no files matched the selected filters");
@@ -113,6 +114,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
                 }]
             };
             apply_filters(&mut candidates, args)?;
+            unique_names(&mut candidates);
             if candidates.is_empty() {
                 bail!("no files matched the selected filters");
             }
@@ -518,6 +520,31 @@ async fn out_dir_ready(path: &Path) -> Result<()> {
     tokio::fs::create_dir_all(path)
         .await
         .map_err(|error| anyhow!("cannot create {}: {error}", path.display()))
+}
+
+fn unique_names(candidates: &mut [Candidate]) {
+    let mut used = std::collections::HashSet::new();
+    for candidate in candidates {
+        candidate.name = unique_name(&mut used, &candidate.name);
+    }
+}
+
+fn unique_name(used: &mut std::collections::HashSet<String>, name: &str) -> String {
+    let base = crate::util::sanitize_filename(name);
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
+        None => (base.clone(), String::new()),
+    };
+    for index in 2.. {
+        let candidate = crate::util::sanitize_filename(&format!("{stem} ({index}){ext}"));
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    base
 }
 
 fn finish_report(report: &Report, output: &OutputArgs) -> Result<i32> {
