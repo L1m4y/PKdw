@@ -1,43 +1,53 @@
-<p align="center">
-  <img src="assets/icon.png" alt="PKdw logo" width="120">
-</p>
+<br/>
 
-<h1 align="center">PKdw</h1>
+<div align="center">
 
-<p align="center">
-  A self-contained PikPak downloader for the terminal, written in Rust.
-</p>
+<img src="assets/icon.png" alt="PKdw" width="192"/>
 
-<p align="center">
-  <img alt="CI" src="https://github.com/L1m4y/PKdw/workflows/CI/badge.svg">
-  <img alt="GPL-3.0" src="https://img.shields.io/github/license/L1m4y/PKdw?color=6F78A8&labelColor=282F62">
-  <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-orange.svg?color=6F78A8&labelColor=282F62">
-</p>
+<h1>PKdw</h1>
 
-One binary. No Python, no shell dependencies beyond the idioms of this
-project, no browser automation. Downloads are parallel, resumable, and the
-default download directory follows the program wherever it goes.
+**A self-contained PikPak downloader for the terminal.**
+
+One binary, written in Rust: parallel and resumable downloads, no Python, no browser automation, and a download folder that travels with the program.
+
+[![Rust](https://img.shields.io/badge/Rust-2021-282F62?logo=rust&logoColor=FFFFFF)](https://www.rust-lang.org/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-282F62?logo=gnu&logoColor=FFFFFF)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=FFFFFF)](https://github.com/L1m4y/PKdw)
+
+</div>
+
+## How it works
+
+PKdw resolves a share, walks its files and downloads them with fixed-size HTTP
+range requests. Each file is written to a sparse `.part` file while a JSON
+sidecar records the completed byte ranges, so an interruption never discards
+progress. Finished files are renamed and the sidecars are removed.
+
+Public shares work without an account. With a refresh token, PKdw can list the
+drive, fetch complete files through `web_content_link`, and copy a share to the
+drive for the full original with `--restore`.
+
+## Installation
+
+```bash
+git clone https://github.com/L1m4y/PKdw.git
+cd PKdw
+cargo build --release
+./target/release/pkdw install
+```
+
+`install` creates a `pkdw` symlink in `~/.local/bin`, so the default download
+directory stays in the source tree.
 
 ## Quick start
 
 ```bash
-cargo build --release
-./target/release/pkdw get "https://mypikpak.com/s/SHARE_ID"
+pkdw get "https://mypikpak.com/s/SHARE_ID"
+pkdw get "https://mypikpak.com/s/SHARE_ID" --largest --quality 1080p
+pkdw info "https://mypikpak.com/s/SHARE_ID"
+pkdw ls
+pkdw doctor
 ```
-
-## Feature snapshot
-
-| Capability | Status |
-| --- | --- |
-| Public share links without an account | Yes |
-| Parallel HTTP range downloads | Yes |
-| Resume after interruption | Yes |
-| Configurable connection count | Yes, `-j/--connections` |
-| Quality selection | `original`, `1080p`, `720p`, `480p` |
-| Drive listing and downloads | Yes, with login |
-| Copy share to drive (`--restore`) | Yes |
-| JSON output | `--json` |
-| Shell completions | bash, zsh, fish, powershell, elvish |
 
 ## Commands
 
@@ -53,73 +63,42 @@ cargo build --release
 | `config` | Show resolved paths |
 | `completions` | Generate shell completions |
 
-### Common download options
-
-| Flag | Meaning |
-| --- | --- |
-| `-o, --output DIR` | Destination folder |
-| `-q, --quality Q` | Stream quality |
-| `--largest` | Keep only the largest file |
-| `--min-size MIB` | Skip smaller files |
-| `--name TEXT` | Case-insensitive name filter |
-| `--pass-code CODE` | Protected share code |
-| `--restore` | Copy to drive, then download the full original |
-| `--delete-after` | Delete the temporary drive copy |
-| `-j, --connections N` | Download workers per file, default 16 |
-| `--chunk-size MIB` | Range size, default 16 |
-| `--overwrite` | Start from scratch |
-| `--dry-run` | Resolve and show selections only |
-
-Exit codes: `0` success, `1` hard failure, `2` incomplete data kept for resume.
-
 ## Download location
 
 ```text
 <folder containing pkdw>/downloads/
 ```
 
-Override per run or globally:
-
-```bash
-pkdw get <link> --output /mnt/storage/videos
-PKDW_DOWNLOADS=/mnt/storage PKDW_HOME=/opt/pkdw pkdw get <link>
-```
+Override with `--output`, `PKDW_DOWNLOADS`, or `PKDW_HOME`.
 
 ## Authentication
 
-1. Open `https://mypikpak.com` and sign in.
+1. Sign in at `https://mypikpak.com`.
 2. DevTools -> Application -> Local Storage -> `https://mypikpak.com`.
-3. Find `credentials_*` and copy its `refresh_token`.
-4. Save it:
+3. Copy the `refresh_token` field from `credentials_*`.
+4. Run:
 
 ```bash
 pkdw auth --from-clipboard
-# or
-pkdw auth --stdin
 ```
 
-Tokens are single-use. PKdw persists every rotation to `.env` immediately.
-Keep the web app closed while using the CLI.
+Tokens are single-use and rotate on every exchange. PKdw persists each rotation to
+`.env` immediately. Keep the PikPak web app closed while using the CLI.
 
-## Quality and missing ranges
+## Behaviour notes
 
-Server links can expose `original`, `1080p`, `720p`, and `480p` streams.
-For anonymous shares, the CDN may serve only part of the original object;
-PKdw preserves the partial file and resumes it later. Use a transcode or
-`--restore` for a complete file.
-
-## Resume files
-
-```text
-movie.mkv.part              sparse bytes on disk
-movie.mkv.part.pkdw.json    completed byte ranges
-```
-
-After a successful download these are removed and the bytes are renamed to
-`movie.mkv`. `--overwrite` discards them. Changing `--chunk-size` is safe but
-may revisit a few boundary segments.
+- `0` success, `1` hard failure, `2` incomplete data kept for resume.
+- `--overwrite` discards resume state and restarts a file.
+- Changing `--chunk-size` is safe and may revisit a few boundary segments.
+- Anonymous shares can expose partial originals. Use a transcode or `--restore`
+  when you need the complete file.
+- `.env` is stored with mode `0600` and is ignored by git.
 
 ## Documentation
 
-- `docs/API.md` — researched endpoints, headers, and limits.
-- `docs/ARCHITECTURE.md` — modules and download algorithm design.
+- `docs/API.md` — endpoints, headers, and observed limits.
+- `docs/ARCHITECTURE.md` — modules, portable paths, and the download design.
+
+<div align="center">
+<i>“One command, every range, no missing bytes.”</i>
+</div>
