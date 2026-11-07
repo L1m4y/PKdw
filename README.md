@@ -10,14 +10,14 @@
 
 One binary, written in Rust: parallel and resumable downloads, no Python, no browser automation, and a download folder that travels with the program.
 
-[![Rust](https://img.shields.io/badge/Rust-2021-FCC624?logo=rust&logoColor=000000)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=000000)](https://github.com/L1m4y/PKdw)
+[![Rust](https://img.shields.io/badge/Rust-2021-6F78A8?logo=rust&logoColor=000000)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=000000)](https://github.com/L1m4y/PKdw)
 
 </div>
 
 <div align="right">
   <a href="LICENSE">
-    <img alt="GPLv3 License" src="https://img.shields.io/badge/License-GPLv3-FCC624?logo=gnu&logoColor=000000">
+    <img alt="GPLv3 License" src="https://img.shields.io/badge/License-GPLv3-6F78A8?logo=gnu&logoColor=000000">
   </a>
 </div>
 
