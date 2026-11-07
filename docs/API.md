@@ -316,6 +316,22 @@ GET /drive/v1/privilege/vip
 - The original of a share can require more quota than a free account has; the
   API then returns `need_more_quota` and omits the link.
 
+## Limits PKdw does not remove
+
+PKdw downloads through the same signed endpoints the web client uses. That keeps
+its use predictable, but also means:
+
+- Anonymous share links can still be capped to a prefix or a few minutes of
+  playback, as enforced by the CDN and the share's `anonymous_play_range`.
+  Those bytes cannot be recovered by changing URLs or headers.
+- Transfer quotas, downstream caps, free-account daily limits, and connected-app
+  throttling are server-side account limits.
+- Anti-abuse, account-risk controls, captcha, and share expiration remain
+  under PikPak's control.
+
+PKdw's job is to make the available bytes efficient, visible, and resumable; it
+does not claim to unlock bytes that the server refuses to serve.
+
 ## Sources
 
 - [`youming-ai/pikpak-downloader`](https://github.com/youming-ai/pikpak-downloader)

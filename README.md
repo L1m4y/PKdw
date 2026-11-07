@@ -8,7 +8,7 @@
 
 **A self-contained PikPak downloader for the terminal.**
 
-Downloads PikPak shared links and drive files in parallel, using the accessible direct streams instead of the browser web UI download limits and barriers.
+Downloads PikPak shared links and drive files through direct API links, parallel ranges, and resumable chunks.
 
 [![Rust](https://img.shields.io/badge/Rust-2021-6F78A8?logo=rust&logoColor=FFFFFF)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux-6F78A8?logo=linux&logoColor=FFFFFF)](https://github.com/L1m4y/PKdw)
@@ -94,6 +94,7 @@ Tokens are single-use and rotate on every exchange. PKdw persists each rotation 
 - Anonymous shares can expose partial originals. Use a transcode or `--restore`
   when you need the complete file.
 - `.env` is stored with mode `0600` and is ignored by git.
+- PKdw uses PikPak endpoints directly; it cannot bypass server-side limits such as transfer quotas, anonymous share range caps, and connected-app throttling.
 
 ## Documentation
 
