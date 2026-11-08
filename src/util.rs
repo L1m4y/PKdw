@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use rand::RngCore;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -411,8 +411,23 @@ mod tests {
     fn parses_content_range() {
         assert_eq!(
             parse_content_range("bytes 10-19/100").unwrap(),
-            (10, 19, Some(100))
+            ParsedContentRange::Satisfied {
+                start: 10,
+                end: 19,
+                total: Some(100),
+            }
         );
-        assert_eq!(parse_content_range("bytes 0-0/*").unwrap(), (0, 0, None));
+        assert_eq!(
+            parse_content_range("bytes 0-0/*").unwrap(),
+            ParsedContentRange::Satisfied {
+                start: 0,
+                end: 0,
+                total: None,
+            }
+        );
+        assert_eq!(
+            parse_content_range("bytes */7").unwrap(),
+            ParsedContentRange::Unsatisfied { total: 7 }
+        );
     }
 }
