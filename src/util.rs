@@ -252,15 +252,27 @@ where
         }
 
         fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Option<u64>, E> {
-            Ok(Some(value.max(0) as u64))
+            if value < 0 {
+                Ok(None)
+            } else {
+                Ok(Some(value as u64))
+            }
         }
 
         fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Option<u64>, E> {
-            Ok(Some(value.max(0.0) as u64))
+            if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+                Ok(None)
+            } else {
+                Ok(Some(value as u64))
+            }
         }
 
         fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Option<u64>, E> {
-            Ok(value.parse().ok())
+            if value.trim().starts_with('-') {
+                Ok(None)
+            } else {
+                Ok(value.parse().ok())
+            }
         }
 
         fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Option<u64>, E> {

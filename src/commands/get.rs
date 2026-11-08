@@ -279,23 +279,16 @@ async fn download_shared(
             report.failed += 1;
             continue;
         };
-        let has_selected_size = selected
-            .expected_size
-            .is_some_and(|value| value > 0);
-        let size = if has_selected_size {
-            selected.expected_size.unwrap()
-        } else {
-            info.size.unwrap_or(candidate.size.unwrap_or(0))
-                .max(candidate.size.unwrap_or(0))
+        let size = match selected.expected_size {
+            Some(size) => Some(size),
+            None if selected.is_original => info.size.or(candidate.size),
+            None => None,
         };
-        if !has_selected_size
-            && info.size.is_none()
-            && candidate.size.is_none()
-        {
+        let Some(size) = size else {
             ui::warn(format!("{name}: PikPak did not report a usable file size"));
             report.failed += 1;
             continue;
-        }
+        };
 
         if !output.quiet {
             println!(
@@ -369,7 +362,33 @@ async fn download_restored(
             info.name.clone()
         };
         let known_size = info.size.or(candidate.size);
-        let size = known_size.unwrap_or(0).max(candidate.size.unwrap_or(0));
+        let Some(size) = known_size else {
+            ui::warn(format!(
+                "{name}: size is unknown; cannot validate drive quota, using direct download"
+            ));
+            let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(ShareLinkSource::new(
+                client.clone(),
+                share_id,
+                candidate.file_id.clone(),
+                token,
+                args.quality,
+                false,
+            )))
+            .shared();
+            let source_id = format!("share:{share_id}:{}", candidate.file_id);
+            match download_file(source, &source_id, &name, None, out_dir, options, args.quality.key())
+                .await
+            {
+                Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
+                Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
+                Err(error) => {
+                    ui::warn(format!("{name}: {error:#}"));
+                    report.failed += 1;
+                }
+            }
+            continue;
+        };
+        let size = size.max(candidate.size.unwrap_or(0));
 
         if !output.quiet {
             println!(
@@ -574,7 +593,7 @@ async fn download_drive(
             source,
             &format!("drive:{}", candidate.file_id),
             &candidate.name,
-            Some(candidate.size.unwrap_or(0)),
+            candidate.size,
             out_dir,
             options,
             "original",
