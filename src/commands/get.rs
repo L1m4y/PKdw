@@ -1,4 +1,4 @@
-use crate::api::models::{DriveFile, FileInfo};
+use crate::api::models::{DriveFile, FileInfo, ResolvedMedia};
 use crate::api::{drive, share, PikPak};
 use crate::cli::{GetArgs, OutputArgs, Quality};
 use crate::download::{
@@ -263,7 +263,7 @@ async fn download_shared(
         } else {
             info.name.clone()
         };
-        let Some(selected) = info.select_media(quality) else {
+        let Some(mut selected) = info.select_media(quality) else {
             if info.quota_blocked_original() && quality == Quality::Original {
                 ui::warn(format!(
                     "{}: original stream needs more quota; use --quality 1080p",
@@ -279,16 +279,17 @@ async fn download_shared(
             report.failed += 1;
             continue;
         };
-        let size = match selected.expected_size {
-            Some(size) => Some(size),
-            None if selected.is_original => info.size.or(candidate.size),
-            None => None,
-        };
-        let Some(size) = size else {
-            ui::warn(format!("{name}: PikPak did not report a usable file size"));
-            report.failed += 1;
-            continue;
-        };
+        if selected.is_original && selected.expected_size.is_none() {
+            selected.expected_size = info.size.or(candidate.size);
+        }
+        if selected.label.to_ascii_lowercase() != quality.key() {
+            ui::warn(format!(
+                "{} is not available for {}; using {}",
+                quality.key(),
+                name,
+                selected.label
+            ));
+        }
 
         if !output.quiet {
             println!(
@@ -296,7 +297,10 @@ async fn download_shared(
                 index + 1,
                 candidates.len(),
                 name,
-                format_size(size),
+                selected
+                    .expected_size
+                    .map(format_size)
+                    .unwrap_or_else(|| "unknown size".to_string()),
                 selected.label
             );
         }
@@ -306,24 +310,12 @@ async fn download_shared(
             share_id,
             candidate.file_id.clone(),
             token,
-            quality,
             false,
         ));
         let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
         let source_id = format!("share:{share_id}:{}", candidate.file_id);
-        let representation = selected.label.clone();
 
-        match download_file(
-            source,
-            &source_id,
-            &name,
-            Some(size),
-            out_dir,
-            options,
-            &representation,
-        )
-        .await
-        {
+        match download_file(source, &source_id, &name, &selected, out_dir, options).await {
             Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
             Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
             Err(error) => {
@@ -366,27 +358,24 @@ async fn download_restored(
             ui::warn(format!(
                 "{name}: size is unknown; cannot validate drive quota, using direct download"
             ));
+            let Some(selected) = info.select_media(args.quality) else {
+                ui::warn(format!(
+                    "{name}: no downloadable stream for {}",
+                    args.quality.key()
+                ));
+                report.failed += 1;
+                continue;
+            };
             let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(ShareLinkSource::new(
                 client.clone(),
                 share_id,
                 candidate.file_id.clone(),
                 token,
-                args.quality,
                 false,
             )))
             .shared();
             let source_id = format!("share:{share_id}:{}", candidate.file_id);
-            match download_file(
-                source,
-                &source_id,
-                &name,
-                None,
-                out_dir,
-                options,
-                args.quality.key(),
-            )
-            .await
-            {
+            match download_file(source, &source_id, &name, &selected, out_dir, options).await {
                 Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
                 Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
                 Err(error) => {
@@ -416,31 +405,27 @@ async fn download_restored(
                 format_size(free),
                 format_size(size)
             ));
+            let Some(mut selected) = info.select_media(args.quality) else {
+                ui::warn(format!(
+                    "{name}: no downloadable stream for {}",
+                    args.quality.key()
+                ));
+                report.failed += 1;
+                continue;
+            };
+            if selected.is_original && selected.expected_size.is_none() {
+                selected.expected_size = Some(size);
+            }
             let inner: Arc<dyn LinkSource> = Arc::new(ShareLinkSource::new(
                 client.clone(),
                 share_id,
                 candidate.file_id.clone(),
                 token,
-                args.quality,
                 false,
             ));
-            let fallback_label = info
-                .select_media(args.quality)
-                .map(|media| media.label)
-                .unwrap_or_else(|| args.quality.key().to_string());
             let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
             let source_id = format!("share:{share_id}:{}", candidate.file_id);
-            match download_file(
-                source,
-                &source_id,
-                &name,
-                Some(size),
-                out_dir,
-                options,
-                &fallback_label,
-            )
-            .await
-            {
+            match download_file(source, &source_id, &name, &selected, out_dir, options).await {
                 Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
                 Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
                 Err(error) => {
@@ -494,14 +479,14 @@ async fn download_restored(
             drive_file.id.clone(),
         )))
         .shared();
+        let media = ResolvedMedia::drive(Some(size));
         let result = download_file(
             source,
             &format!("drive:{}", drive_file.id),
             &name,
-            Some(size),
+            &media,
             out_dir,
             options,
-            "original",
         )
         .await;
 
@@ -597,14 +582,14 @@ async fn download_drive(
             candidate.file_id.clone(),
         )))
         .shared();
+        let media = ResolvedMedia::drive(candidate.size);
         match download_file(
             source,
             &format!("drive:{}", candidate.file_id),
             &candidate.name,
-            candidate.size,
+            &media,
             out_dir,
             options,
-            "original",
         )
         .await
         {

@@ -82,7 +82,7 @@ impl Media {
     }
 
     pub fn label(&self) -> &str {
-        if self.is_origin || self.media_name.eq_ignore_ascii_case("original") {
+        if self.is_original() {
             "original"
         } else if !self.media_name.is_empty() {
             &self.media_name
@@ -91,8 +91,41 @@ impl Media {
         }
     }
 
+    pub fn is_original(&self) -> bool {
+        self.is_origin || self.media_name.eq_ignore_ascii_case("original")
+    }
+
+    /// Stable identifier for the concrete media representation. URL refreshes
+    /// must resolve this identifier again instead of re-running the quality
+    /// selection, which may pick a different fallback.
+    pub fn representation_id(&self) -> String {
+        if self.is_original() {
+            "original".to_string()
+        } else if !self.media_name.is_empty() {
+            self.media_name.clone()
+        } else if !self.resolution_name.is_empty() {
+            self.resolution_name.clone()
+        } else {
+            self.label().to_string()
+        }
+    }
+
+    fn is_downloadable(&self) -> bool {
+        self.is_visible != Some(false) && self.need_more_quota != Some(true) && self.url().is_some()
+    }
+
     fn height(&self) -> Option<u32> {
         self.video.as_ref().and_then(|video| video.height)
+    }
+
+    fn resolved(&self) -> Option<ResolvedMedia> {
+        Some(ResolvedMedia {
+            url: self.url()?.to_string(),
+            representation_id: self.representation_id(),
+            label: self.label().to_string(),
+            is_original: self.is_original(),
+            expected_size: media_size(self.url()?),
+        })
     }
 }
 
@@ -118,12 +151,26 @@ pub struct FileInfo {
     pub params: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SelectedMedia {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMedia {
     pub url: String,
+    pub representation_id: String,
     pub label: String,
     pub is_original: bool,
     pub expected_size: Option<u64>,
+}
+
+impl ResolvedMedia {
+    /// A drive file is always downloaded as its original representation.
+    pub fn drive(size: Option<u64>) -> Self {
+        Self {
+            url: String::new(),
+            representation_id: "original".to_string(),
+            label: "original".to_string(),
+            is_original: true,
+            expected_size: size,
+        }
+    }
 }
 
 impl FileInfo {
@@ -131,61 +178,69 @@ impl FileInfo {
         self.kind.ends_with("folder")
     }
 
+    /// Resolve a previously selected representation by identifier. This is
+    /// used for URL refreshes: the same media must still be visible and
+    /// downloadable, otherwise the download fails instead of silently picking
+    /// another quality.
+    pub fn resolved_media_by_id(&self, representation_id: &str) -> Option<ResolvedMedia> {
+        if representation_id.eq_ignore_ascii_case("original") {
+            if let Some(media) = self
+                .medias
+                .iter()
+                .find(|media| media.is_downloadable() && media.is_original())
+            {
+                return media.resolved();
+            }
+            if !self.web_content_link.is_empty() {
+                return Some(ResolvedMedia {
+                    url: self.web_content_link.clone(),
+                    representation_id: "original".to_string(),
+                    label: "original".to_string(),
+                    is_original: true,
+                    expected_size: self.size,
+                });
+            }
+            return None;
+        }
+
+        self.medias
+            .iter()
+            .find(|media| {
+                media.is_downloadable()
+                    && media
+                        .representation_id()
+                        .eq_ignore_ascii_case(representation_id)
+            })
+            .and_then(Media::resolved)
+    }
+
     /// Pick a stream by quality. Unknown or lower-quality requests fall back to
     /// the best available visible stream, never to a stream the server marked
     /// as quota-restricted.
-    pub fn select_media(&self, quality: Quality) -> Option<SelectedMedia> {
-        let visible = |media: &&Media| {
-            media.is_visible != Some(false)
-                && media.need_more_quota != Some(true)
-                && media.url().is_some()
-        };
-
-        if let Some(media) = self
-            .medias
-            .iter()
-            .filter(visible)
-            .find(|media| media.is_origin || media.media_name.eq_ignore_ascii_case("original"))
-        {
-            if quality == Quality::Original {
-                return Some(SelectedMedia {
-                    url: media.url()?.to_string(),
-                    label: "original".to_string(),
-                    is_original: true,
-                    expected_size: media_size(media.url()?),
-                });
-            }
-        }
-
-        if quality == Quality::Original && !self.web_content_link.is_empty() {
-            return Some(SelectedMedia {
-                url: self.web_content_link.clone(),
-                label: "original".to_string(),
-                is_original: true,
-                expected_size: self.size,
-            });
+    pub fn select_media(&self, quality: Quality) -> Option<ResolvedMedia> {
+        if quality == Quality::Original {
+            return self.resolved_media_by_id("original");
         }
 
         let target = match quality {
-            Quality::Original => None,
+            Quality::Original => unreachable!(),
             Quality::P1080 => Some(1080),
             Quality::P720 => Some(720),
             Quality::P480 => Some(480),
         };
 
-        let mut candidates: Vec<&Media> = self.medias.iter().filter(visible).collect();
+        let mut candidates: Vec<&Media> = self
+            .medias
+            .iter()
+            .filter(|media| media.is_downloadable())
+            .collect();
         if let Some(target) = target {
             let exact = candidates.iter().copied().find(|media| {
                 media.media_name.eq_ignore_ascii_case(&format!("{target}P"))
                     || media.height() == Some(target)
             });
             if let Some(media) = exact {
-                return Some(SelectedMedia {
-                    url: media.url()?.to_string(),
-                    label: media.label().to_string(),
-                    is_original: media.is_origin,
-                    expected_size: media_size(media.url()?),
-                });
+                return media.resolved();
             }
 
             // Nearest lower resolution, then nearest higher, then original.
@@ -197,40 +252,24 @@ impl FileInfo {
                     (1, height - target)
                 }
             });
-        } else {
-            candidates.sort_by_key(|media| {
-                (
-                    !media.is_origin,
-                    std::cmp::Reverse(media.height().unwrap_or(0)),
-                )
-            });
         }
 
         if let Some(media) = candidates.first() {
-            return Some(SelectedMedia {
-                url: media.url()?.to_string(),
-                label: media.label().to_string(),
-                is_original: media.is_origin,
-                expected_size: media_size(media.url()?),
-            });
+            return media.resolved();
         }
 
+        // `web_content_link` is the original file, never a transcode. Label it
+        // accordingly so manifests do not claim a quality that was not used.
         if !self.web_content_link.is_empty() {
-            return Some(SelectedMedia {
-                url: self.web_content_link.clone(),
-                label: quality.key().to_string(),
-                is_original: quality == Quality::Original,
-                expected_size: self.size,
-            });
+            return self.resolved_media_by_id("original");
         }
         None
     }
 
     pub fn quota_blocked_original(&self) -> bool {
-        self.medias.iter().any(|media| {
-            (media.is_origin || media.media_name.eq_ignore_ascii_case("original"))
-                && media.need_more_quota == Some(true)
-        })
+        self.medias
+            .iter()
+            .any(|media| media.is_original() && media.need_more_quota == Some(true))
     }
 
     pub fn available_qualities(&self) -> Vec<String> {
@@ -440,5 +479,48 @@ mod tests {
     #[test]
     fn parses_string_sizes() {
         assert_eq!(info().size, Some(6_110_009_965));
+    }
+
+    #[test]
+    fn pins_the_selected_transcode_instead_of_the_requested_quality() {
+        let info = info();
+        let selected = info.select_media(Quality::P480).unwrap();
+        assert_eq!(selected.representation_id, "720P");
+        assert_eq!(
+            info.resolved_media_by_id(&selected.representation_id)
+                .unwrap()
+                .url,
+            selected.url
+        );
+
+        let mut without_720 = info.clone();
+        without_720
+            .medias
+            .retain(|media| !media.media_name.eq_ignore_ascii_case("720P"));
+        assert!(without_720.resolved_media_by_id("720P").is_none());
+    }
+
+    #[test]
+    fn a_transcode_does_not_inherit_the_original_size() {
+        let info = info();
+        let selected = info.select_media(Quality::P720).unwrap();
+        assert!(!selected.is_original);
+        assert_eq!(selected.expected_size, None);
+    }
+
+    #[test]
+    fn web_content_link_fallback_is_labelled_original() {
+        let info: FileInfo = serde_json::from_value(serde_json::json!({
+            "name": "movie.mkv",
+            "size": "123",
+            "web_content_link": "https://example.invalid/original?f=123",
+            "medias": []
+        }))
+        .unwrap();
+        let selected = info.select_media(Quality::P1080).unwrap();
+        assert_eq!(selected.label, "original");
+        assert_eq!(selected.representation_id, "original");
+        assert!(selected.is_original);
+        assert_eq!(selected.expected_size, Some(123));
     }
 }
