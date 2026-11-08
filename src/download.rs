@@ -637,17 +637,27 @@ async fn fetch_range(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("range response has no Content-Range"))?;
-    let (actual_start, actual_end, actual_total) = parse_content_range(content_range)?;
-    if actual_start != start || actual_end != end {
-        bail!(
-            "CDN returned range {actual_start}-{actual_end}, expected {start}-{end} (short or shifted)"
-        );
-    }
-    if expected_total > 0 {
-        let total = actual_total
-            .ok_or_else(|| anyhow!("CDN did not report a numeric total for range {start}-{end}"))?;
-        if total != expected_total {
-            bail!("CDN returned total {total}, expected {expected_total} for range {start}-{end}");
+    match parse_content_range(content_range)? {
+        crate::util::ParsedContentRange::Unsatisfied { total } => {
+            bail!("range {start}-{end} is unavailable from the CDN (HTTP 416; complete length {total})")
+        }
+        crate::util::ParsedContentRange::Satisfied {
+            start: actual_start,
+            end: actual_end,
+            total: actual_total,
+        } => {
+            if actual_start != start || actual_end != end {
+                bail!(
+                    "CDN returned range {actual_start}-{actual_end}, expected {start}-{end} (short or shifted)"
+                );
+            }
+            if expected_total > 0 {
+                let total = actual_total
+                    .ok_or_else(|| anyhow!("CDN did not report a numeric total for range {start}-{end}"))?;
+                if total != expected_total {
+                    bail!("CDN returned total {total}, expected {expected_total} for range {start}-{end}");
+                }
+            }
         }
     }
 
@@ -762,24 +772,19 @@ async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        let (_, _, total) = parse_content_range(content_range)?;
-        return total
-            .ok_or_else(|| anyhow!("PikPak did not report a usable size while probing {url}"));
+        match parse_content_range(content_range) {
+            Ok(crate::util::ParsedContentRange::Unsatisfied { total }) => return Ok(total),
+            _ => {
+                return Err(anyhow!(
+                    "PikPak did not report a usable size while probing this URL"
+                ))
+            }
+        }
     }
 
     if status != StatusCode::PARTIAL_CONTENT {
-        // Some CDNs ignore Range and answer 200. Keep this as a fallback
-        // hint, but only if it conservatively matches the declared total.
-        if let Some(length) = response
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            return Ok(length);
-        }
         return Err(anyhow!(
-            "PikPak did not return 206 Partial Content while probing {url}"
+            "PikPak did not return 206 Partial Content while probing this URL"
         ));
     }
 
@@ -788,11 +793,23 @@ async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("probe response has no Content-Range"))?;
-    let (_, actual_end, total) = parse_content_range(content_range)?;
-    if actual_end != 0 {
-        return Err(anyhow!("probe returned an unexpected range {actual_end}"));
+    match parse_content_range(content_range)? {
+        crate::util::ParsedContentRange::Satisfied {
+            start: actual_start,
+            end: actual_end,
+            total,
+        } => {
+            if actual_start != 0 || actual_end != 0 {
+                return Err(anyhow!(
+                    "probe returned an unexpected range {actual_start}-{actual_end}"
+                ));
+            }
+            total.ok_or_else(|| anyhow!("probe did not report a content total"))
+        }
+        crate::util::ParsedContentRange::Unsatisfied { .. } => Err(anyhow!(
+            "probe reported an unavailable range instead of bytes 0-0"
+        )),
     }
-    total.ok_or_else(|| anyhow!("probe did not report a content total"))
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {

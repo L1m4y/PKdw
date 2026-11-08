@@ -198,33 +198,56 @@ pub fn random_device_id() -> String {
     md5_hex(&bytes)
 }
 
-pub fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedContentRange {
+    Satisfied { start: u64, end: u64, total: Option<u64> },
+    Unsatisfied { total: u64 },
+}
+
+pub fn parse_content_range(value: &str) -> Result<ParsedContentRange> {
     let value = value
         .strip_prefix("bytes ")
-        .ok_or_else(|| anyhow::anyhow!("invalid Content-Range unit: {value}"))?;
+        .ok_or_else(|| anyhow!("invalid Content-Range unit: {value}"))?;
     let (bounds, total) = value
         .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("invalid Content-Range: {value}"))?;
+        .ok_or_else(|| anyhow!("invalid Content-Range: {value}"))?;
+    let total = total.trim();
+    if bounds.trim() == "*" {
+        let total: u64 = total
+            .parse()
+            .map_err(|_| anyhow!("invalid Content-Range total: {total}"))?;
+        return Ok(ParsedContentRange::Unsatisfied { total });
+    }
+
     let (start, end) = bounds
         .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("invalid Content-Range bounds: {bounds}"))?;
+        .ok_or_else(|| anyhow!("invalid Content-Range bounds: {bounds}"))?;
     let start: u64 = start
         .trim()
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid Content-Range start: {start}"))?;
+        .map_err(|_| anyhow!("invalid Content-Range start: {start}"))?;
     let end: u64 = end
         .trim()
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid Content-Range end: {end}"))?;
+        .map_err(|_| anyhow!("invalid Content-Range end: {end}"))?;
     if end < start {
-        bail!("invalid Content-Range: end {end} precedes start {start}");
+        anyhow::bail!("invalid Content-Range: end {end} precedes start {start}");
     }
-    let total = total
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|_| total.trim() != "*");
-    Ok((start, end, total))
+    let total = if total == "*" {
+        None
+    } else {
+        Some(
+            total
+                .parse::<u64>()
+                .map_err(|_| anyhow!("invalid Content-Range total: {total}"))?,
+        )
+    };
+    if let Some(total) = total {
+        if total <= end {
+            anyhow::bail!("invalid Content-Range total {total} for range {start}-{end}");
+        }
+    }
+    Ok(ParsedContentRange::Satisfied { start, end, total })
 }
 
 pub fn size_from_str(value: Option<&str>) -> u64 {
