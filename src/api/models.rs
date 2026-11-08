@@ -416,6 +416,11 @@ pub struct TaskResponse {
     pub message: String,
     #[serde(default)]
     pub progress: i64,
+    /// Preserve fields that this client does not know yet. PikPak task
+    /// responses may expose the created file id in a field that has not been
+    /// verified against a real fixture.
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -424,6 +429,8 @@ pub struct RestoreResponse {
     pub task_id: String,
     #[serde(default)]
     pub id: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
 }
 
 fn media_size(url: &str) -> Option<u64> {

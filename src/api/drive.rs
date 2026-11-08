@@ -226,6 +226,35 @@ pub async fn find_by_name(
     Ok(None)
 }
 
+/// Collect every entry reachable from the drive root. Used to take a stable
+/// ID snapshot before a restore so pre-existing homonyms are never confused
+/// with the file created by the operation.
+pub async fn collect_drive_files(client: &PikPak) -> Result<Vec<DriveFile>> {
+    let mut files = Vec::new();
+    let mut stack = vec![String::new()];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent_id) = stack.pop() {
+        if !parent_id.is_empty() && !visited.insert(parent_id.clone()) {
+            continue;
+        }
+        for entry in list_all(client, &parent_id).await? {
+            if entry.is_folder() {
+                stack.push(entry.id.clone());
+            }
+            files.push(entry);
+        }
+    }
+    Ok(files)
+}
+
+pub async fn snapshot_ids(client: &PikPak) -> Result<std::collections::HashSet<String>> {
+    Ok(collect_drive_files(client)
+        .await?
+        .into_iter()
+        .map(|file| file.id)
+        .collect())
+}
+
 pub async fn delete_file(client: &PikPak, file_id: &str) -> Result<()> {
     let _: serde_json::Value = client
         .authed_json(

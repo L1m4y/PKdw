@@ -1,4 +1,4 @@
-use crate::api::models::{DriveFile, FileInfo, ResolvedMedia};
+use crate::api::models::{FileInfo, ResolvedMedia};
 use crate::api::{drive, share, PikPak};
 use crate::cli::{GetArgs, OutputArgs, Quality};
 use crate::download::{
@@ -328,6 +328,12 @@ async fn download_shared(
     Ok(report)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneFileOutcome {
+    Complete,
+    Incomplete,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_restored(
     client: &PikPak,
@@ -339,170 +345,30 @@ async fn download_restored(
     args: &GetArgs,
     output: &OutputArgs,
 ) -> Result<Report> {
-    let session = client.require_session().await?;
-    let _ = session;
+    // Fail before starting the batch when the session itself is unusable.
+    let _ = client.require_session().await?;
     let mut report = Report::default();
 
     for (index, candidate) in candidates.iter().enumerate() {
-        let info = match &candidate.info {
-            Some(info) => info.clone(),
-            None => share::file_info(client, share_id, &candidate.file_id, token).await?,
-        };
-        let name = if info.name.is_empty() {
-            candidate.name.clone()
-        } else {
-            info.name.clone()
-        };
-        let known_size = info.size.or(candidate.size);
-        let Some(size) = known_size else {
-            ui::warn(format!(
-                "{name}: size is unknown; cannot validate drive quota, using direct download"
-            ));
-            let Some(selected) = info.select_media(args.quality) else {
-                ui::warn(format!(
-                    "{name}: no downloadable stream for {}",
-                    args.quality.key()
-                ));
-                report.failed += 1;
-                continue;
-            };
-            let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(ShareLinkSource::new(
-                client.clone(),
-                share_id,
-                candidate.file_id.clone(),
-                token,
-                false,
-            )))
-            .shared();
-            let source_id = format!("share:{share_id}:{}", candidate.file_id);
-            match download_file(source, &source_id, &name, &selected, out_dir, options).await {
-                Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
-                Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
-                Err(error) => {
-                    ui::warn(format!("{name}: {error:#}"));
-                    report.failed += 1;
-                }
-            }
-            continue;
-        };
-        let size = size.max(candidate.size.unwrap_or(0));
-
-        if !output.quiet {
-            println!(
-                "[{}/{}] {} ({}) - copy to drive",
-                index + 1,
-                candidates.len(),
-                name,
-                format_size(size)
-            );
-        }
-
-        let about = drive::quota(client).await?;
-        let free = about.quota.limit.saturating_sub(about.quota.usage);
-        if free < size {
-            ui::warn(format!(
-                "not enough drive space for {name} ({} free, {} needed); using the share stream instead",
-                format_size(free),
-                format_size(size)
-            ));
-            let Some(mut selected) = info.select_media(args.quality) else {
-                ui::warn(format!(
-                    "{name}: no downloadable stream for {}",
-                    args.quality.key()
-                ));
-                report.failed += 1;
-                continue;
-            };
-            if selected.is_original && selected.expected_size.is_none() {
-                selected.expected_size = Some(size);
-            }
-            let inner: Arc<dyn LinkSource> = Arc::new(ShareLinkSource::new(
-                client.clone(),
-                share_id,
-                candidate.file_id.clone(),
-                token,
-                false,
-            ));
-            let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
-            let source_id = format!("share:{share_id}:{}", candidate.file_id);
-            match download_file(source, &source_id, &name, &selected, out_dir, options).await {
-                Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
-                Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
-                Err(error) => {
-                    ui::warn(format!("{name}: {error:#}"));
-                    report.failed += 1;
-                }
-            }
-            continue;
-        }
-
-        let mut restored = false;
-        let existing = drive::find_many_by_name(client, &name, known_size, 5).await?;
-        if existing.len() > 1 {
-            return Err(anyhow!(
-                "{name}: multiple drive files share the same name and size; refusing to guess"
-            ));
-        }
-        let drive_file = if existing.is_empty() {
-            let response = drive::restore_share(
-                client,
-                share_id,
-                token,
-                std::slice::from_ref(&candidate.file_id),
-            )
-            .await?;
-            let task_id = if response.task_id.is_empty() {
-                response.id
-            } else {
-                response.task_id
-            };
-            if !task_id.is_empty() {
-                drive::wait_task(client, &task_id, Duration::from_secs(30 * 60)).await?;
-            }
-            restored = true;
-            wait_for_drive_file_excluding(client, &name, known_size, &[], Duration::from_secs(120))
-                .await?
-        } else {
-            existing.first().cloned()
-        };
-
-        let Some(drive_file) = drive_file else {
-            ui::warn(format!(
-                "{name}: it did not appear in the drive after copying"
-            ));
-            report.failed += 1;
-            continue;
-        };
-
-        let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(DriveLinkSource::new(
-            client.clone(),
-            drive_file.id.clone(),
-        )))
-        .shared();
-        let media = ResolvedMedia::drive(Some(size));
-        let result = download_file(
-            source,
-            &format!("drive:{}", drive_file.id),
-            &name,
-            &media,
+        match download_one_restored(
+            client,
+            share_id,
+            token,
+            candidate,
+            index,
+            candidates.len(),
             out_dir,
             options,
+            args,
+            output,
         )
-        .await;
-
-        match result {
-            Ok(DownloadOutcome::Complete(_)) => {
-                report.complete += 1;
-                if args.delete_after && restored {
-                    match drive::delete_file(client, &drive_file.id).await {
-                        Ok(()) => ui::status(output.quiet, format!("removed drive copy: {name}")),
-                        Err(error) => ui::warn(format!("could not remove drive copy: {error:#}")),
-                    }
-                }
-            }
-            Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
+        .await
+        {
+            Ok(OneFileOutcome::Complete) => report.complete += 1,
+            Ok(OneFileOutcome::Incomplete) => report.incomplete += 1,
+            Err(error) if is_fatal_auth_error(&error) => return Err(error),
             Err(error) => {
-                ui::warn(format!("{name}: {error:#}"));
+                ui::warn(format!("{}: {error:#}", candidate.name));
                 report.failed += 1;
             }
         }
@@ -511,27 +377,297 @@ async fn download_restored(
     Ok(report)
 }
 
-async fn wait_for_drive_file_excluding(
+#[allow(clippy::too_many_arguments)]
+async fn download_one_restored(
+    client: &PikPak,
+    share_id: &str,
+    token: &str,
+    candidate: &Candidate,
+    index: usize,
+    total: usize,
+    out_dir: &Path,
+    options: &DownloadOptions,
+    args: &GetArgs,
+    output: &OutputArgs,
+) -> Result<OneFileOutcome> {
+    let mut info = match &candidate.info {
+        Some(info) => info.clone(),
+        None => share::file_info(client, share_id, &candidate.file_id, token).await?,
+    };
+    let name = if info.name.is_empty() {
+        candidate.name.clone()
+    } else {
+        info.name.clone()
+    };
+
+    let Some(size) = resolve_restore_size(client, share_id, token, &mut info, candidate).await?
+    else {
+        ui::warn(format!(
+            "{name}: size is unknown; cannot validate drive quota, using direct download"
+        ));
+        return download_share_stream(
+            client, share_id, token, candidate, &info, &name, None, out_dir, options, args,
+        )
+        .await;
+    };
+
+    if !output.quiet {
+        println!(
+            "[{}/{}] {} ({}) - copy to drive",
+            index + 1,
+            total,
+            name,
+            format_size(size)
+        );
+    }
+
+    let about = drive::quota(client).await?;
+    let free = about.quota.limit.saturating_sub(about.quota.usage);
+    if free < size {
+        ui::warn(format!(
+            "not enough drive space for {name} ({} free, {} needed); using the share stream instead",
+            format_size(free),
+            format_size(size)
+        ));
+        return download_share_stream(
+            client,
+            share_id,
+            token,
+            candidate,
+            &info,
+            &name,
+            Some(size),
+            out_dir,
+            options,
+            args,
+        )
+        .await;
+    }
+
+    // Snapshot IDs before the restore. Name and size alone are not proof of
+    // identity: a pre-existing homonym must never be downloaded or deleted.
+    let before_ids = drive::snapshot_ids(client).await?;
+    let response = drive::restore_share(
+        client,
+        share_id,
+        token,
+        std::slice::from_ref(&candidate.file_id),
+    )
+    .await?;
+
+    if !response.task_id.is_empty() {
+        // Only a field explicitly named `task_id` is polled. Unknown fields
+        // are preserved in TaskResponse.extra but not guessed.
+        drive::wait_task(client, &response.task_id, Duration::from_secs(30 * 60)).await?;
+    } else if !response.id.is_empty() && !before_ids.contains(&response.id) {
+        // `id` is not assumed to be a task id. It is only used when it can be
+        // validated as the restored drive file.
+        if let Ok(candidate_info) = drive::file_info(client, &response.id).await {
+            if candidate_info.name == name
+                && candidate_info.size.is_none_or(|actual| actual == size)
+            {
+                return finish_restored_download(
+                    client,
+                    &name,
+                    size,
+                    &response.id,
+                    out_dir,
+                    options,
+                    args,
+                    output,
+                    true,
+                )
+                .await;
+            }
+        }
+    }
+
+    let created_id = wait_for_new_drive_file(client, &name, size, &before_ids).await?;
+    finish_restored_download(
+        client,
+        &name,
+        size,
+        &created_id,
+        out_dir,
+        options,
+        args,
+        output,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_restored_download(
     client: &PikPak,
     name: &str,
-    size: Option<u64>,
-    excluded: &[String],
-    timeout: Duration,
-) -> Result<Option<DriveFile>> {
-    let deadline = Instant::now() + timeout;
+    size: u64,
+    drive_file_id: &str,
+    out_dir: &Path,
+    options: &DownloadOptions,
+    args: &GetArgs,
+    output: &OutputArgs,
+    created_by_this_restore: bool,
+) -> Result<OneFileOutcome> {
+    let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(DriveLinkSource::new(
+        client.clone(),
+        drive_file_id,
+    )))
+    .shared();
+    let media = ResolvedMedia::drive(Some(size));
+    let result = download_file(
+        source,
+        &format!("drive:{drive_file_id}"),
+        name,
+        &media,
+        out_dir,
+        options,
+    )
+    .await;
+
+    match result {
+        Ok(DownloadOutcome::Complete(_)) => {
+            // `--delete-after` is fail-closed: only an ID proven to be the
+            // result of this restore can be removed, and only after the local
+            // file has been verified.
+            if args.delete_after {
+                if !created_by_this_restore {
+                    ui::warn(format!(
+                        "not removing the drive copy of {name}: its identity was not proven"
+                    ));
+                } else {
+                    match drive::delete_file(client, drive_file_id).await {
+                        Ok(()) => ui::status(output.quiet, format!("removed drive copy: {name}")),
+                        Err(error) => ui::warn(format!("could not remove drive copy: {error:#}")),
+                    }
+                }
+            }
+            Ok(OneFileOutcome::Complete)
+        }
+        Ok(DownloadOutcome::Incomplete { .. }) => Ok(OneFileOutcome::Incomplete),
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_share_stream(
+    client: &PikPak,
+    share_id: &str,
+    token: &str,
+    candidate: &Candidate,
+    info: &FileInfo,
+    name: &str,
+    fallback_size: Option<u64>,
+    out_dir: &Path,
+    options: &DownloadOptions,
+    args: &GetArgs,
+) -> Result<OneFileOutcome> {
+    let Some(mut selected) = info.select_media(args.quality) else {
+        if info.quota_blocked_original() && args.quality == Quality::Original {
+            bail!(
+                "{name}: the original stream needs more quota; use --quality 1080p or free drive space"
+            );
+        }
+        bail!("{name}: no downloadable stream for {}", args.quality.key());
+    };
+    if selected.is_original && selected.expected_size.is_none() {
+        selected.expected_size = fallback_size;
+    }
+    let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(ShareLinkSource::new(
+        client.clone(),
+        share_id,
+        candidate.file_id.clone(),
+        token,
+        false,
+    )))
+    .shared();
+    let source_id = format!("share:{share_id}:{}", candidate.file_id);
+    match download_file(source, &source_id, name, &selected, out_dir, options).await? {
+        DownloadOutcome::Complete(_) => Ok(OneFileOutcome::Complete),
+        DownloadOutcome::Incomplete { .. } => Ok(OneFileOutcome::Incomplete),
+    }
+}
+
+async fn resolve_restore_size(
+    client: &PikPak,
+    share_id: &str,
+    token: &str,
+    info: &mut FileInfo,
+    candidate: &Candidate,
+) -> Result<Option<u64>> {
+    let first = info.size;
+    let second = candidate.size;
+    if !sizes_conflict(first, second) {
+        return Ok(first.or(second));
+    }
+
+    ui::warn(format!(
+        "{}: file_info reports {} bytes but the share listing reports {}; re-checking metadata",
+        info.name,
+        first.unwrap_or(0),
+        second.unwrap_or(0)
+    ));
+    *info = share::file_info(client, share_id, &candidate.file_id, token).await?;
+    if sizes_conflict(info.size, candidate.size) {
+        bail!(
+            "{}: inconsistent size metadata (file_info={}, share={})",
+            info.name,
+            info.size
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            candidate
+                .size
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    Ok(info.size.or(candidate.size))
+}
+
+fn sizes_conflict(first: Option<u64>, second: Option<u64>) -> bool {
+    matches!((first, second), (Some(a), Some(b)) if a != b)
+}
+
+async fn wait_for_new_drive_file(
+    client: &PikPak,
+    name: &str,
+    size: u64,
+    before_ids: &std::collections::HashSet<String>,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
     loop {
-        let matches = drive::find_many_by_name(client, name, Some(size.unwrap_or(0)), 5).await?;
-        if let Some(file) = matches
+        let files = drive::collect_drive_files(client).await?;
+        let mut matches: Vec<_> = files
             .into_iter()
-            .find(|file| !excluded.iter().any(|id| id == &file.id))
-        {
-            return Ok(Some(file));
+            .filter(|file| {
+                !file.is_folder()
+                    && !before_ids.contains(&file.id)
+                    && file.name == name
+                    && file.size == Some(size)
+            })
+            .collect();
+        match matches.len() {
+            1 => return Ok(matches.remove(0).id),
+            0 => {}
+            count => bail!(
+                "{name}: {count} new drive files match the restored name and size; refusing to guess"
+            ),
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            bail!(
+                "{name}: the restored file did not appear as a new, uniquely identifiable drive entry"
+            );
         }
         tokio::time::sleep(Duration::from_secs(4)).await;
     }
+}
+
+fn is_fatal_auth_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("not authenticated")
+        || text.contains("token refresh failed")
+        || text.contains("refresh token")
+        || text.contains("invalid_grant")
 }
 
 async fn collect_drive_candidates(client: &PikPak, folder_id: &str) -> Result<Vec<Candidate>> {
@@ -657,5 +793,30 @@ fn finish_report(report: &Report, output: &OutputArgs) -> Result<i32> {
         Ok(2)
     } else {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_conflicting_restore_sizes() {
+        assert!(!sizes_conflict(Some(10), Some(10)));
+        assert!(!sizes_conflict(Some(10), None));
+        assert!(!sizes_conflict(None, Some(10)));
+        assert!(!sizes_conflict(None, None));
+        assert!(sizes_conflict(Some(10), Some(11)));
+    }
+
+    #[test]
+    fn treats_session_failures_as_fatal() {
+        assert!(is_fatal_auth_error(&anyhow!(
+            "not authenticated; run `pkdw auth --from-clipboard` first"
+        )));
+        assert!(is_fatal_auth_error(&anyhow!(
+            "PikPak rejected the refresh token (invalid_grant)"
+        )));
+        assert!(!is_fatal_auth_error(&anyhow!("not enough drive space")));
     }
 }
