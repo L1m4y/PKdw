@@ -652,8 +652,9 @@ async fn fetch_range(
                 );
             }
             if expected_total > 0 {
-                let total = actual_total
-                    .ok_or_else(|| anyhow!("CDN did not report a numeric total for range {start}-{end}"))?;
+                let total = actual_total.ok_or_else(|| {
+                    anyhow!("CDN did not report a numeric total for range {start}-{end}")
+                })?;
                 if total != expected_total {
                     bail!("CDN returned total {total}, expected {expected_total} for range {start}-{end}");
                 }

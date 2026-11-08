@@ -200,8 +200,14 @@ pub fn random_device_id() -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedContentRange {
-    Satisfied { start: u64, end: u64, total: Option<u64> },
-    Unsatisfied { total: u64 },
+    Satisfied {
+        start: u64,
+        end: u64,
+        total: Option<u64>,
+    },
+    Unsatisfied {
+        total: u64,
+    },
 }
 
 pub fn parse_content_range(value: &str) -> Result<ParsedContentRange> {
