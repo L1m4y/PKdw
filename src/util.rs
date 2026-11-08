@@ -435,5 +435,28 @@ mod tests {
             parse_content_range("bytes */7").unwrap(),
             ParsedContentRange::Unsatisfied { total: 7 }
         );
+        assert_eq!(
+            parse_content_range("bytes */0").unwrap(),
+            ParsedContentRange::Unsatisfied { total: 0 }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_content_ranges() {
+        for value in [
+            "bytes */abc",
+            "bytes 1-0/5",
+            "bytes 0-0/0",
+            "bytes 0-0/18446744073709551616",
+            "bytes 0-0/",
+            "bytes 0-0",
+            "bytes */*",
+            "octets 0-0/1",
+        ] {
+            assert!(
+                parse_content_range(value).is_err(),
+                "{value} should have been rejected"
+            );
+        }
     }
 }

@@ -3,7 +3,7 @@ use crate::api::models::FileInfo;
 use crate::api::{drive, share};
 use crate::cli::Quality;
 use crate::ui;
-use crate::util::{format_size, parse_content_range, sanitize_filename};
+use crate::util::{format_size, parse_content_range, sanitize_filename, ParsedContentRange};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
@@ -291,21 +291,14 @@ pub async fn download_file(
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("cannot create {}", dest_dir.display()))?;
-    let known_size = size;
-    let unknown_size = known_size.is_none();
-    let size = if let Some(size) = known_size {
+    let size = if let Some(size) = size {
         size
     } else {
         let url = source.link(true).await?;
-        let resolved = probe_content_length(&options.http, &url).await?;
-        // Refresh the link cache for the real segment requests.
-        let _ = source.link(true).await;
-        resolved
+        // The probe resolves and caches this exact URL. Keep using it for the
+        // segment requests instead of rotating the link a second time.
+        probe_content_length(&options.http, &url).await?.size
     };
-
-    if unknown_size && size == 0 {
-        return Err(anyhow!("{name}: PikPak did not report a usable file size"));
-    }
 
     let dest = dest_dir.join(sanitize_filename(name));
     let part = append_suffix(&dest, ".part");
@@ -623,14 +616,19 @@ async fn fetch_range(
     let response = client
         .get(url)
         .header(RANGE, format!("bytes={start}-{end}"))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
         .with_context(|| format!("range request {start}-{end} failed"))?;
 
     let status = response.status();
+    if status == StatusCode::OK {
+        bail!("the CDN ignored Range while fetching {start}-{end} (HTTP 200)");
+    }
     if status != StatusCode::PARTIAL_CONTENT {
         bail!("range {start}-{end} was not delivered as 206 Partial Content (HTTP {status})");
     }
+    ensure_identity_encoding(&response)?;
 
     let content_range = response
         .headers()
@@ -757,60 +755,102 @@ fn manifest_hash_ok(manifest_path: &Path, dest: &Path) -> bool {
         .unwrap_or(false)
 }
 
-async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64> {
+#[derive(Debug, Clone)]
+struct ProbeResult {
+    size: u64,
+}
+
+/// Probe a CDN link with a one-byte range request.
+///
+/// The URL is never included in errors: PikPak CDN links carry signed query
+/// parameters that must not end up in terminals, CI logs or diagnostics.
+async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<ProbeResult> {
     let response = client
         .get(url)
         .header(RANGE, "bytes=0-0")
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
-        .with_context(|| format!("cannot probe content length for {url}"))?;
+        .context("cannot probe the CDN link")?;
 
     let status = response.status();
+
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         let content_range = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        match parse_content_range(content_range) {
-            Ok(crate::util::ParsedContentRange::Unsatisfied { total }) => return Ok(total),
-            _ => {
-                return Err(anyhow!(
-                    "PikPak did not report a usable size while probing this URL"
-                ))
-            }
-        }
+            .ok_or_else(|| anyhow!("probe returned HTTP 416 without Content-Range"))?;
+        return match parse_content_range(content_range)? {
+            ParsedContentRange::Unsatisfied { total } => Ok(ProbeResult { size: total }),
+            ParsedContentRange::Satisfied { .. } => Err(anyhow!(
+                "probe returned HTTP 416 with a satisfied Content-Range"
+            )),
+        };
     }
 
+    if status == StatusCode::OK {
+        return Err(anyhow!(
+            "the CDN ignored Range (HTTP 200); sequential GET downloads are not supported"
+        ));
+    }
     if status != StatusCode::PARTIAL_CONTENT {
         return Err(anyhow!(
-            "PikPak did not return 206 Partial Content while probing this URL"
+            "the CDN answered the size probe with HTTP {status}"
         ));
     }
 
+    ensure_identity_encoding(&response)?;
     let content_range = response
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| anyhow!("probe response has no Content-Range"))?;
-    match parse_content_range(content_range)? {
-        crate::util::ParsedContentRange::Satisfied {
-            start: actual_start,
-            end: actual_end,
-            total,
-        } => {
-            if actual_start != 0 || actual_end != 0 {
-                return Err(anyhow!(
-                    "probe returned an unexpected range {actual_start}-{actual_end}"
-                ));
-            }
-            total.ok_or_else(|| anyhow!("probe did not report a content total"))
+        .ok_or_else(|| anyhow!("probe response has no Content-Range"))?
+        .to_string();
+    let total = match parse_content_range(&content_range)? {
+        ParsedContentRange::Satisfied {
+            start: 0,
+            end: 0,
+            total: Some(total),
+        } => total,
+        ParsedContentRange::Satisfied { start, end, total } => {
+            return Err(anyhow!(
+            "probe returned range {start}-{end} with total {total:?}, expected bytes 0-0/<total>"
+        ))
         }
-        crate::util::ParsedContentRange::Unsatisfied { .. } => Err(anyhow!(
-            "probe reported an unavailable range instead of bytes 0-0"
-        )),
+        ParsedContentRange::Unsatisfied { .. } => {
+            return Err(anyhow!(
+                "probe reported an unavailable range instead of bytes 0-0"
+            ))
+        }
+    };
+
+    let body = response
+        .bytes()
+        .await
+        .context("cannot read the probe response body")?;
+    if body.len() != 1 {
+        return Err(anyhow!(
+            "probe returned {} bytes for a bytes=0-0 request",
+            body.len()
+        ));
     }
+
+    Ok(ProbeResult { size: total })
+}
+
+fn ensure_identity_encoding(response: &reqwest::Response) -> Result<()> {
+    let Some(encoding) = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(());
+    };
+    if encoding.eq_ignore_ascii_case("identity") {
+        return Ok(());
+    }
+    bail!("the CDN returned Content-Encoding: {encoding}; byte ranges need identity encoding")
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -867,5 +907,113 @@ mod tests {
             append_suffix(path, ".part"),
             PathBuf::from("/tmp/movie.mkv.part")
         );
+    }
+
+    fn probe_client() -> reqwest::Client {
+        reqwest::Client::builder().no_gzip().build().unwrap()
+    }
+
+    async fn spawn_raw_server(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{address}/file?token=SECRET&sign=SECRET2")
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_satisfied_range_with_numeric_total() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/5\r\nConnection: close\r\n\r\nX",
+        )
+        .await;
+        let result = probe_content_length(&probe_client(), &url).await.unwrap();
+        assert_eq!(result.size, 5);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_satisfied_range_without_numeric_total() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/*\r\nConnection: close\r\n\r\nX",
+        )
+        .await;
+        assert!(probe_content_length(&probe_client(), &url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_unsatisfied_zero_length() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let result = probe_content_length(&probe_client(), &url).await.unwrap();
+        assert_eq!(result.size, 0);
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_unsatisfied_numeric_length() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */123\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let result = probe_content_length(&probe_client(), &url).await.unwrap();
+        assert_eq!(result.size, 123);
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_416_without_content_range() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(probe_content_length(&probe_client(), &url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_200() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        )
+        .await;
+        let error = probe_content_length(&probe_client(), &url)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ignored Range"));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_compressed_ranges() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/5\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\nX",
+        )
+        .await;
+        let error = probe_content_length(&probe_client(), &url)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Content-Encoding"));
+    }
+
+    #[tokio::test]
+    async fn probe_errors_never_include_the_signed_url() {
+        let url = spawn_raw_server(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let error = probe_content_length(&probe_client(), &url)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains("SECRET"));
+        assert!(!text.contains("SECRET2"));
+        assert!(!text.contains("token="));
     }
 }
