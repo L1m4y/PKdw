@@ -1,5 +1,5 @@
 use crate::cli::Quality;
-use crate::util::{de_lenient_u64, format_size};
+use crate::util::{de_lenient_u64, de_optional_u64, format_size};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,8 +27,8 @@ pub struct ShareEntry {
     pub name: String,
     #[serde(default)]
     pub kind: String,
-    #[serde(default, deserialize_with = "de_lenient_u64")]
-    pub size: u64,
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub size: Option<u64>,
     #[serde(default)]
     pub hash: String,
     #[serde(default)]
@@ -104,8 +104,8 @@ pub struct FileInfo {
     pub name: String,
     #[serde(default)]
     pub kind: String,
-    #[serde(default, deserialize_with = "de_lenient_u64")]
-    pub size: u64,
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub size: Option<u64>,
     #[serde(default)]
     pub hash: String,
     #[serde(default)]
@@ -123,6 +123,7 @@ pub struct SelectedMedia {
     pub url: String,
     pub label: String,
     pub is_original: bool,
+    pub expected_size: u64,
 }
 
 impl FileInfo {
@@ -151,6 +152,7 @@ impl FileInfo {
                     url: media.url()?.to_string(),
                     label: "original".to_string(),
                     is_original: true,
+                    expected_size: media_size(media.url()?).unwrap_or(0),
                 });
             }
         }
@@ -160,6 +162,7 @@ impl FileInfo {
                 url: self.web_content_link.clone(),
                 label: "original".to_string(),
                 is_original: true,
+                expected_size: self.size.unwrap_or(0),
             });
         }
 
@@ -181,6 +184,7 @@ impl FileInfo {
                     url: media.url()?.to_string(),
                     label: media.label().to_string(),
                     is_original: media.is_origin,
+                    expected_size: media_size(media.url()?).unwrap_or(0),
                 });
             }
 
@@ -207,6 +211,7 @@ impl FileInfo {
                 url: media.url()?.to_string(),
                 label: media.label().to_string(),
                 is_original: media.is_origin,
+                expected_size: media_size(media.url()?).unwrap_or(0),
             });
         }
 
@@ -215,6 +220,7 @@ impl FileInfo {
                 url: self.web_content_link.clone(),
                 label: quality.key().to_string(),
                 is_original: quality == Quality::Original,
+                expected_size: self.size.unwrap_or(0),
             });
         }
         None
@@ -250,7 +256,7 @@ impl FileInfo {
     }
 
     pub fn describe(&self) -> String {
-        let mut text = format!("{}  {}", self.name, format_size(self.size));
+        let mut text = format!("{}  {}", self.name, format_size(self.size.unwrap_or(0)));
         let qualities = self.available_qualities();
         if !qualities.is_empty() {
             text.push_str(&format!("  [{}]", qualities.join(", ")));
@@ -281,8 +287,8 @@ pub struct DriveFile {
     pub name: String,
     #[serde(default)]
     pub kind: String,
-    #[serde(default, deserialize_with = "de_lenient_u64")]
-    pub size: u64,
+    #[serde(default, deserialize_with = "de_optional_u64")]
+    pub size: Option<u64>,
     #[serde(default)]
     pub hash: String,
     #[serde(default)]
@@ -381,6 +387,13 @@ pub struct RestoreResponse {
     pub id: String,
 }
 
+fn media_size(url: &str) -> Option<u64> {
+    url.split('?').nth(1)?.split('&').find_map(|part| {
+        part.strip_prefix("f=")
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,10 +433,12 @@ mod tests {
             info.select_media(Quality::P480).unwrap().url,
             "https://example.invalid/720"
         );
+        // The test fixture URLs carry the size only for Original in the f= form,
+        // so P480 reports unknown when no usable f= is embedded.
     }
 
     #[test]
     fn parses_string_sizes() {
-        assert_eq!(info().size, 6_110_009_965);
+        assert_eq!(info().size, Some(6_110_009_965));
     }
 }

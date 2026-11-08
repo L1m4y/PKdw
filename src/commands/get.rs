@@ -109,7 +109,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
                 vec![Candidate {
                     file_id: entry.id.clone(),
                     name: entry.name.clone(),
-                    size: entry.size,
+                    size: entry.size.unwrap_or(0),
                     info: None,
                 }]
             };
@@ -154,7 +154,7 @@ async fn share_candidates(
                 .map(|entry| Candidate {
                     file_id: entry.id,
                     name: entry.name,
-                    size: entry.size,
+                    size: entry.size.unwrap_or(0),
                     info: None,
                 })
                 .collect());
@@ -162,7 +162,7 @@ async fn share_candidates(
         return Ok(vec![Candidate {
             file_id: info.id.clone(),
             name: info.name.clone(),
-            size: info.size,
+            size: info.size.unwrap_or(0),
             info: Some(info),
         }]);
     }
@@ -174,7 +174,7 @@ async fn share_candidates(
         .map(|entry| Candidate {
             file_id: entry.id,
             name: entry.name,
-            size: entry.size,
+            size: entry.size.unwrap_or(0),
             info: None,
         })
         .collect())
@@ -259,15 +259,36 @@ async fn download_shared(
         } else {
             info.name.clone()
         };
-        let size = info.size.max(candidate.size);
+        let Some(selected) = info.select_media(quality) else {
+            if info.quota_blocked_original() && quality == Quality::Original {
+                ui::warn(format!(
+                    "{}: original stream needs more quota; use --quality 1080p",
+                    name
+                ));
+            } else {
+                ui::warn(format!(
+                    "{}: no downloadable stream for {}",
+                    name,
+                    quality.key()
+                ));
+            }
+            report.failed += 1;
+            continue;
+        };
+        let size = if selected.expected_size > 0 {
+            selected.expected_size
+        } else {
+            info.size.unwrap_or(0).max(candidate.size)
+        };
 
         if !output.quiet {
             println!(
-                "[{}/{}] {} ({})",
+                "[{}/{}] {} ({}) [{}]",
                 index + 1,
                 candidates.len(),
                 name,
-                format_size(size)
+                format_size(size),
+                selected.label
             );
         }
 
@@ -282,7 +303,17 @@ async fn download_shared(
         let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
         let source_id = format!("share:{share_id}:{}", candidate.file_id);
 
-        match download_file(source, &source_id, &name, size, out_dir, options).await {
+        match download_file(
+            source,
+            &source_id,
+            &name,
+            Some(size),
+            out_dir,
+            options,
+            quality.key(),
+        )
+        .await
+        {
             Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
             Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
             Err(error) => {
@@ -320,7 +351,7 @@ async fn download_restored(
         } else {
             info.name.clone()
         };
-        let size = info.size.max(candidate.size);
+        let size = info.size.unwrap_or(0).max(candidate.size);
 
         if !output.quiet {
             println!(
@@ -350,7 +381,17 @@ async fn download_restored(
             ));
             let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
             let source_id = format!("share:{share_id}:{}", candidate.file_id);
-            match download_file(source, &source_id, &name, size, out_dir, options).await {
+            match download_file(
+                source,
+                &source_id,
+                &name,
+                Some(size),
+                out_dir,
+                options,
+                args.quality.key(),
+            )
+            .await
+            {
                 Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
                 Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
                 Err(error) => {
@@ -362,27 +403,33 @@ async fn download_restored(
         }
 
         let mut restored = false;
-        let drive_file = match drive::find_by_name(client, &name, Some(size), 5).await? {
-            Some(file) => Some(file),
-            None => {
-                let response = drive::restore_share(
-                    client,
-                    share_id,
-                    token,
-                    std::slice::from_ref(&candidate.file_id),
-                )
-                .await?;
-                let task_id = if response.task_id.is_empty() {
-                    response.id
-                } else {
-                    response.task_id
-                };
-                if !task_id.is_empty() {
-                    drive::wait_task(client, &task_id, Duration::from_secs(30 * 60)).await?;
-                }
-                restored = true;
-                wait_for_drive_file(client, &name, size, Duration::from_secs(120)).await?
+        let existing = drive::find_many_by_name(client, &name, Some(size), 5).await?;
+        if existing.len() > 1 {
+            return Err(anyhow!(
+                "{name}: multiple drive files share the same name and size; refusing to guess"
+            ));
+        }
+        let drive_file = if existing.is_empty() {
+            let response = drive::restore_share(
+                client,
+                share_id,
+                token,
+                std::slice::from_ref(&candidate.file_id),
+            )
+            .await?;
+            let task_id = if response.task_id.is_empty() {
+                response.id
+            } else {
+                response.task_id
+            };
+            if !task_id.is_empty() {
+                drive::wait_task(client, &task_id, Duration::from_secs(30 * 60)).await?;
             }
+            restored = true;
+            wait_for_drive_file_excluding(client, &name, size, &[], Duration::from_secs(120))
+                .await?
+        } else {
+            existing.first().cloned()
         };
 
         let Some(drive_file) = drive_file else {
@@ -402,9 +449,10 @@ async fn download_restored(
             source,
             &format!("drive:{}", drive_file.id),
             &name,
-            size,
+            Some(size),
             out_dir,
             options,
+            "original",
         )
         .await;
 
@@ -429,15 +477,20 @@ async fn download_restored(
     Ok(report)
 }
 
-async fn wait_for_drive_file(
+async fn wait_for_drive_file_excluding(
     client: &PikPak,
     name: &str,
     size: u64,
+    excluded: &[String],
     timeout: Duration,
 ) -> Result<Option<DriveFile>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(file) = drive::find_by_name(client, name, Some(size), 5).await? {
+        let matches = drive::find_many_by_name(client, name, Some(size), 5).await?;
+        if let Some(file) = matches
+            .into_iter()
+            .find(|file| !excluded.iter().any(|id| id == &file.id))
+        {
             return Ok(Some(file));
         }
         if Instant::now() >= deadline {
@@ -463,7 +516,7 @@ async fn collect_drive_candidates(client: &PikPak, folder_id: &str) -> Result<Ve
                 out.push(Candidate {
                     file_id: entry.id,
                     name: entry.name,
-                    size: entry.size,
+                    size: entry.size.unwrap_or(0),
                     info: None,
                 });
             }
@@ -499,9 +552,10 @@ async fn download_drive(
             source,
             &format!("drive:{}", candidate.file_id),
             &candidate.name,
-            candidate.size,
+            Some(candidate.size),
             out_dir,
             options,
+            "original",
         )
         .await
         {

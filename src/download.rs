@@ -184,22 +184,69 @@ pub fn selected_url(info: &FileInfo, quality: Quality) -> Result<String> {
     )
 }
 
+const PART_STATE_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PartState {
     version: u32,
     source_id: String,
     size: u64,
+    representation: String,
     completed: Vec<(u64, u64)>,
 }
 
 impl PartState {
-    fn new(source_id: &str, size: u64) -> Self {
+    fn new(source_id: &str, size: u64, representation: &str) -> Self {
         Self {
-            version: 1,
+            version: PART_STATE_VERSION,
             source_id: source_id.to_string(),
             size,
+            representation: representation.to_string(),
             completed: Vec::new(),
         }
+    }
+
+    fn validate_for(&self, expected_size: u64, representation: &str) -> Result<()> {
+        if self.version != PART_STATE_VERSION {
+            bail!("resume state version {} is not supported", self.version);
+        }
+        if self.size != expected_size {
+            bail!(
+                "resume state belongs to a different file ({} bytes, expected {})",
+                self.size,
+                expected_size
+            );
+        }
+        if self.representation != representation {
+            bail!(
+                "resume state belongs to representation {}, not {}",
+                self.representation,
+                representation
+            );
+        }
+        let mut total = 0u64;
+        let mut last_end: Option<u64> = None;
+        for (start, end) in &self.completed {
+            if start > end {
+                bail!("resume state contains an invalid range, start > end");
+            }
+            if *end >= self.size {
+                bail!("resume state contains a range outside the file size");
+            }
+            if let Some(last) = last_end {
+                if *start <= last {
+                    bail!("resume state contains overlapping or out-of-order ranges");
+                }
+            }
+            last_end = Some(*end);
+            total = total
+                .checked_add(end.saturating_sub(*start) + 1)
+                .ok_or_else(|| anyhow!("resume state contains an implausibly large range"))?;
+        }
+        if total > self.size {
+            bail!("resume state contains more completed bytes than the file");
+        }
+        Ok(())
     }
 
     fn completed_bytes(&self) -> u64 {
@@ -236,26 +283,56 @@ pub async fn download_file(
     source: Arc<dyn LinkSource>,
     source_id: &str,
     name: &str,
-    size: u64,
+    size: Option<u64>,
     dest_dir: &Path,
     options: &DownloadOptions,
+    representation: &str,
 ) -> Result<DownloadOutcome> {
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("cannot create {}", dest_dir.display()))?;
+    let size = size.ok_or_else(|| anyhow!("{name}: PikPak did not report a usable file size"))?;
     let dest = dest_dir.join(sanitize_filename(name));
     let part = append_suffix(&dest, ".part");
     let state_path = append_suffix(&dest, ".part.pkdw.json");
+    let manifest_path = append_suffix(&dest, ".pkdw.manifest.json");
 
     if options.overwrite {
         remove_if_exists(&part).await?;
         remove_if_exists(&state_path).await?;
+        remove_if_exists(&manifest_path).await?;
         remove_if_exists(&dest).await?;
     }
 
     if dest.exists() {
         let existing = std::fs::metadata(&dest)?.len();
-        if size == 0 || existing == size {
+        if existing != size {
+            bail!(
+                "destination exists with a different size: {} ({} bytes, expected {}); use --overwrite",
+                dest.display(),
+                existing,
+                size
+            );
+        }
+
+        let mut manifest_ok = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .is_some_and(|manifest| {
+                manifest
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id)
+                    && manifest.get("size").and_then(serde_json::Value::as_u64) == Some(size)
+                    && manifest
+                        .get("representation")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(representation)
+            });
+        if manifest_ok {
+            manifest_ok = manifest_hash_ok(&manifest_path, &dest);
+        }
+        if manifest_ok {
             ui::status(
                 options.quiet,
                 format!(
@@ -266,11 +343,10 @@ pub async fn download_file(
             );
             return Ok(DownloadOutcome::Complete(dest));
         }
+
         bail!(
-            "destination exists with a different size: {} ({} bytes, expected {}); use --overwrite",
-            dest.display(),
-            existing,
-            size
+            "destination {} has the expected size but no verified manifest; use --overwrite",
+            dest.display()
         );
     }
 
@@ -284,23 +360,39 @@ pub async fn download_file(
     let mut state = match std::fs::read_to_string(&state_path) {
         Ok(raw) => serde_json::from_str::<PartState>(&raw)
             .with_context(|| format!("resume state is corrupt: {}", state_path.display()))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => PartState::new(source_id, size),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            PartState::new(source_id, size, representation)
+        }
         Err(error) => return Err(error.into()),
     };
 
-    if state.size != size || state.source_id != source_id {
+    let part_truncated = part_existed
+        && std::fs::metadata(&part)
+            .map(|metadata| metadata.len() < size)
+            .unwrap_or(false);
+
+    if state.source_id != source_id {
         bail!(
-            "resume state belongs to a different file ({} bytes, source {}); use --overwrite",
-            state.size,
-            state.source_id
+            "resume state belongs to a different source ({}; expected {})",
+            state.source_id,
+            source_id
         );
     }
+    state.validate_for(size, representation)?;
 
-    // A state file without its partial file would make us skip bytes that are
-    // not on disk. An interrupted first run (part created, no state yet) is
-    // safe to adopt because every segment will be written again.
-    if state_existed && !part_existed {
+    // Do not trust byte ranges whose file is missing or has been truncated.
+    // Persist that invalidation immediately; otherwise the next launch may
+    // still believe that segments which are no longer on disk are complete.
+    if !part_existed || part_truncated {
         state.completed.clear();
+        if part_truncated {
+            ui::warn("partial file is shorter than its sidecar; all segments will be retried");
+        }
+        save_state(&state_path, &state)?;
+    } else if !state_existed {
+        // A file can be created ahead of the first completed segment. Keep
+        // the sidecar present so an early interruption is still resumable.
+        save_state(&state_path, &state)?;
     }
 
     let file = Arc::new(
@@ -385,10 +477,12 @@ pub async fn download_file(
                 let state_path = state_path.clone();
                 let bar = bar.clone();
                 let http = options.http.clone();
+                let total_size = size;
                 async move {
-                    let result =
-                        download_segment(source, http, file, state, state_path, bar, start, end)
-                            .await;
+                    let result = download_segment(
+                        source, http, file, state, state_path, bar, start, end, total_size,
+                    )
+                    .await;
                     (start, end, result)
                 }
             })
@@ -412,14 +506,25 @@ pub async fn download_file(
     }
 
     if pending.is_empty() {
-        file.sync_all().ok();
+        file.sync_all()
+            .context("failed to sync completed download")?;
         drop(file);
         if dest.exists() {
             remove_if_exists(&dest).await?;
         }
+        let sha256 = sha256_file(&part)?;
         tokio::fs::rename(&part, &dest)
             .await
             .with_context(|| format!("cannot move {} into place", part.display()))?;
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source_id": source_id,
+                "size": size,
+                "representation": representation,
+                "sha256": sha256,
+            }))?,
+        )?;
         remove_if_exists(&state_path).await?;
         bar.finish_and_clear();
         ui::status(
@@ -460,6 +565,7 @@ async fn download_segment(
     bar: indicatif::ProgressBar,
     start: u64,
     end: u64,
+    total_size: u64,
 ) -> Result<()> {
     let expected = end - start + 1;
     let attempts = 4u32;
@@ -476,7 +582,7 @@ async fn download_segment(
             }
         };
 
-        match fetch_range(&http, &url, start, end, &file).await {
+        match fetch_range(&http, &url, start, end, &file, total_size).await {
             Ok(()) => {
                 {
                     let mut guard = state.lock().await;
@@ -502,6 +608,7 @@ async fn fetch_range(
     start: u64,
     end: u64,
     file: &File,
+    expected_total: u64,
 ) -> Result<()> {
     let response = client
         .get(url)
@@ -526,11 +633,18 @@ async fn fetch_range(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| anyhow!("range response has no Content-Range"))?;
-    let (actual_start, actual_end, _) = parse_content_range(content_range)?;
-    if actual_start != start || actual_end < end {
+    let (actual_start, actual_end, actual_total) = parse_content_range(content_range)?;
+    if actual_start != start || actual_end != end {
         bail!(
             "CDN returned range {actual_start}-{actual_end}, expected {start}-{end} (short or shifted)"
         );
+    }
+    if expected_total > 0 {
+        let total = actual_total
+            .ok_or_else(|| anyhow!("CDN did not report a numeric total for range {start}-{end}"))?;
+        if total != expected_total {
+            bail!("CDN returned total {total}, expected {expected_total} for range {start}-{end}");
+        }
     }
 
     let mut stream = response.bytes_stream();
@@ -539,12 +653,15 @@ async fn fetch_range(
         if chunk.is_empty() {
             continue;
         }
+        let next = offset
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow!("range {start}-{end} length overflow"))?;
+        if next > end + 1 {
+            bail!("CDN sent more bytes than requested for range {start}-{end}");
+        }
         write_all_at(file, &chunk, offset)
             .with_context(|| format!("cannot write at offset {offset}"))?;
-        offset += chunk.len() as u64;
-        if offset > end + 1 {
-            bail!("CDN sent more bytes than requested for {start}-{end}");
-        }
+        offset = next;
     }
     if offset != end + 1 {
         bail!(
@@ -594,6 +711,37 @@ async fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn manifest_hash_ok(manifest_path: &Path, dest: &Path) -> bool {
+    let manifest = match std::fs::read_to_string(manifest_path) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let Some(expected) = manifest.get("sha256").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    sha256_file(dest)
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
@@ -631,7 +779,7 @@ mod tests {
 
     #[test]
     fn merges_completed_ranges() {
-        let mut state = PartState::new("id", 100);
+        let mut state = PartState::new("id", 100, "original");
         state.insert(10, 19);
         state.insert(20, 29);
         state.insert(0, 9);

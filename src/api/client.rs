@@ -207,10 +207,12 @@ impl PikPak {
     }
 
     pub async fn logout(&self) -> Result<()> {
+        // Lock order must match session(): session first, config second.
+        let mut session = self.session.lock().await;
         let mut config = self.config.lock().await;
         config.remove(KEY_REFRESH_TOKEN);
         config.save()?;
-        *self.session.lock().await = None;
+        *session = None;
         Ok(())
     }
 
@@ -226,9 +228,9 @@ impl PikPak {
                         // A rotated token must be persisted before any other
                         // request can use or replace it.
                         if let Err(error) = config.save() {
-                            eprintln!(
-                                "warning: could not persist the rotated refresh token: {error:#}"
-                            );
+                            return Err(anyhow!(
+                                "could not persist the rotated refresh token: {error:#}"
+                            ));
                         }
                     }
                     if let Some(aud) = jwt_aud(&session.access_token) {

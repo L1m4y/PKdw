@@ -16,27 +16,11 @@ pub async fn run(client: &PikPak, args: &LsArgs, output: &OutputArgs) -> Result<
         return Ok(0);
     }
 
-    let mut page_token = String::new();
-    let mut entries = Vec::new();
-    loop {
-        let mut params = vec![
-            ("limit".to_string(), args.limit.to_string()),
-            ("thumbnail_size".to_string(), "SIZE_MEDIUM".to_string()),
-        ];
-        if !target.id.is_empty() {
-            params.push(("parent_id".to_string(), target.id.clone()));
-        }
-        if !page_token.is_empty() {
-            params.push(("page_token".to_string(), page_token.clone()));
-        }
-        let page: crate::api::models::DriveListResponse = client
-            .authed_json(reqwest::Method::GET, "/drive/v1/files", &params, None)
-            .await?;
-        entries.extend(page.files);
-        page_token = page.next_page_token;
-        if page_token.is_empty() {
-            break;
-        }
+    // Reuse the protected pagination used by drive::list_all. The manual
+    // page-token loop here previously had no duplicate-token protection.
+    let mut entries = drive::list_all(client, &target.id).await?;
+    if entries.len() > usize::try_from(args.limit).unwrap_or(entries.len()) {
+        entries.truncate(args.limit as usize);
     }
 
     entries.sort_by(|a, b| {

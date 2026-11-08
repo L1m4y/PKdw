@@ -77,7 +77,7 @@ pub async fn run(client: &PikPak, args: &InfoArgs, output: &OutputArgs) -> Resul
 }
 
 fn print_share_summary(files: &share::ShareFiles, output: &OutputArgs) -> Result<()> {
-    let total: u64 = files.entries.iter().map(|entry| entry.size).sum();
+    let total: u64 = files.entries.iter().filter_map(|entry| entry.size).sum();
     if output.json {
         println!(
             "{}",
@@ -102,7 +102,7 @@ fn print_file_info(info: &crate::api::models::FileInfo, output: &OutputArgs) {
             serde_json::to_string_pretty(&json!({
                 "id": info.id,
                 "name": info.name,
-                "size": info.size,
+                "size": info.size.unwrap_or(0),
                 "hash": info.hash,
                 "qualities": qualities,
                 "quota_blocked_original": info.quota_blocked_original(),
@@ -116,7 +116,7 @@ fn print_file_info(info: &crate::api::models::FileInfo, output: &OutputArgs) {
         return;
     }
     ui::info_line("name", &info.name);
-    ui::info_line("size", format_size(info.size));
+    ui::info_line("size", format_size(info.size.unwrap_or(0)));
     if !info.id.is_empty() {
         ui::info_line("id", &info.id);
     }

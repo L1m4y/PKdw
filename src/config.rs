@@ -29,20 +29,27 @@ impl fmt::Debug for ConfigFile {
 impl ConfigFile {
     pub fn load(path: PathBuf) -> Result<Self> {
         let mut values = BTreeMap::new();
-        if let Ok(text) = fs::read_to_string(&path) {
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let Some((key, value)) = line.split_once('=') else {
+                        continue;
+                    };
+                    let key = key.trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    values.insert(key.to_string(), unquote(value.trim()).to_string());
                 }
-                let Some((key, value)) = line.split_once('=') else {
-                    continue;
-                };
-                let key = key.trim();
-                if key.is_empty() {
-                    continue;
-                }
-                values.insert(key.to_string(), unquote(value.trim()).to_string());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot read configuration file {}", path.display()));
             }
         }
         Ok(Self { path, values })
@@ -80,7 +87,15 @@ impl ConfigFile {
     }
 
     pub fn save(&self) -> Result<()> {
-        let existing = fs::read_to_string(&self.path).unwrap_or_default();
+        let existing = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot read configuration file {}", self.path.display())
+                });
+            }
+        };
         let mut output: Vec<String> = Vec::new();
         let mut written = BTreeMap::<String, bool>::new();
 

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="assets/icon.png" alt="PKdw" width="192"/>
+<img src="assets/icon.png" alt="PKdw" width="176"/>
 
 <h1>PKdw</h1>
 

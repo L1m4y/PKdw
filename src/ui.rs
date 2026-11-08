@@ -8,7 +8,11 @@ pub fn tree_line(depth: usize, entry: &ShareEntry) {
     if entry.is_folder() {
         println!("{indent}[dir] {}/", entry.name);
     } else {
-        println!("{indent}{}  {}", entry.name, format_size(entry.size));
+        println!(
+            "{indent}{}  {}",
+            entry.name,
+            format_size(entry.size.unwrap_or(0))
+        );
     }
 }
 
@@ -20,7 +24,11 @@ pub fn drive_line(entry: &DriveFile) {
     if entry.is_folder() {
         println!("[dir] {}/", entry.name);
     } else {
-        println!("{:>10}  {}", format_size(entry.size), entry.name);
+        println!(
+            "{:>10}  {}",
+            format_size(entry.size.unwrap_or(0)),
+            entry.name
+        );
     }
 }
 

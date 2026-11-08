@@ -169,10 +169,18 @@ async fn walk(
     }
 
     let mut page_token = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pages = 0usize;
     loop {
+        if pages > 10_000 {
+            bail!("too many pages while listing share {}", share_id);
+        }
         let token = if page_token.is_empty() {
             None
         } else {
+            if !seen.insert(page_token.clone()) {
+                bail!("share listing repeated next_page_token: {page_token}");
+            }
             Some(page_token.as_str())
         };
         let page = share_detail_page(client, share_id, parent_id, pass_code_token, token).await?;
@@ -206,6 +214,7 @@ async fn walk(
             }
         }
         page_token = page.next_page_token;
+        pages += 1;
         if page_token.is_empty() {
             break;
         }

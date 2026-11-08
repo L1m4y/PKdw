@@ -23,7 +23,12 @@ pub async fn list_page(client: &PikPak, parent_id: &str, limit: u32) -> Result<D
 pub async fn list_all(client: &PikPak, parent_id: &str) -> Result<Vec<DriveFile>> {
     let mut files = Vec::new();
     let mut page_token = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pages = 0usize;
     loop {
+        if pages > 10_000 {
+            bail!("too many pages while listing drive parent {}", parent_id);
+        }
         let mut params = vec![
             ("limit".to_string(), "200".to_string()),
             ("thumbnail_size".to_string(), "SIZE_MEDIUM".to_string()),
@@ -32,6 +37,9 @@ pub async fn list_all(client: &PikPak, parent_id: &str) -> Result<Vec<DriveFile>
             params.push(("parent_id".to_string(), parent_id.to_string()));
         }
         if !page_token.is_empty() {
+            if !seen.insert(page_token.clone()) {
+                bail!("drive listing repeated next_page_token: {page_token}");
+            }
             params.push(("page_token".to_string(), page_token.clone()));
         }
         let page: DriveListResponse = client
@@ -40,6 +48,7 @@ pub async fn list_all(client: &PikPak, parent_id: &str) -> Result<Vec<DriveFile>
             .context("cannot list the drive")?;
         files.extend(page.files);
         page_token = page.next_page_token;
+        pages += 1;
         if page_token.is_empty() {
             break;
         }
@@ -68,17 +77,25 @@ pub async fn resolve_path(client: &PikPak, path: &str) -> Result<DriveFile> {
     let mut found: Option<DriveFile> = None;
     for (index, part) in parts.iter().enumerate() {
         let entries = list_all(client, &parent_id).await?;
-        let entry = entries
+        let mut matches: Vec<_> = entries
             .into_iter()
-            .find(|entry| entry.name == *part)
-            .ok_or_else(|| {
-                let prefix = parts[..index].join("/");
-                if prefix.is_empty() {
-                    anyhow!("no such drive entry: {part}")
-                } else {
-                    anyhow!("no such drive entry: /{prefix}/{part}")
-                }
-            })?;
+            .filter(|entry| entry.name == *part)
+            .collect();
+        if matches.len() > 1 {
+            bail!(
+                "ambiguous drive path: {} matches found for {}",
+                matches.len(),
+                part
+            );
+        }
+        let entry = matches.pop().ok_or_else(|| {
+            let prefix = parts[..index].join("/");
+            if prefix.is_empty() {
+                anyhow!("no such drive entry: {part}")
+            } else {
+                anyhow!("no such drive entry: /{prefix}/{part}")
+            }
+        })?;
         if index + 1 < parts.len() && !entry.is_folder() {
             bail!("/{} is not a folder", parts[..=index].join("/"));
         }
@@ -94,7 +111,7 @@ fn root_entry() -> DriveFile {
         id: String::new(),
         name: "/".to_string(),
         kind: "drive#folder".to_string(),
-        size: 0,
+        size: Some(0),
         hash: String::new(),
         web_content_link: String::new(),
         parent_id: String::new(),
@@ -168,9 +185,13 @@ pub async fn wait_task(client: &PikPak, task_id: &str, timeout: Duration) -> Res
             )
             .await?;
         match task.phase.as_str() {
-            "PHASE_TYPE_COMPLETE" | "PHASE_TYPE_COMPLETE_WITH_ERROR" => return Ok(task),
-            "PHASE_TYPE_ERROR" | "PHASE_TYPE_FAILED" => {
-                bail!("copy task failed: {}", task.message)
+            "PHASE_TYPE_COMPLETE" => return Ok(task),
+            "PHASE_TYPE_COMPLETE_WITH_ERROR" | "PHASE_TYPE_ERROR" | "PHASE_TYPE_FAILED" => {
+                bail!(
+                    "copy task failed ({phase}): {message}",
+                    phase = task.phase,
+                    message = task.message
+                )
             }
             _ => {}
         }
@@ -188,9 +209,13 @@ pub async fn find_by_name(
     max_depth: usize,
 ) -> Result<Option<DriveFile>> {
     let mut stack = vec![(String::new(), 0usize)];
+    let mut visited = std::collections::HashSet::new();
     while let Some((parent_id, depth)) = stack.pop() {
+        if !parent_id.is_empty() && !visited.insert(parent_id.clone()) {
+            continue;
+        }
         for entry in list_all(client, &parent_id).await? {
-            if entry.name == name && size.is_none_or(|wanted| entry.size == wanted) {
+            if entry.name == name && size.is_none_or(|wanted| entry.size.unwrap_or(0) == wanted) {
                 return Ok(Some(entry));
             }
             if entry.is_folder() && depth < max_depth {
@@ -211,4 +236,29 @@ pub async fn delete_file(client: &PikPak, file_id: &str) -> Result<()> {
         )
         .await?;
     Ok(())
+}
+
+pub async fn find_many_by_name(
+    client: &PikPak,
+    name: &str,
+    size: Option<u64>,
+    max_depth: usize,
+) -> Result<Vec<DriveFile>> {
+    let mut matches = Vec::new();
+    let mut stack = vec![(String::new(), 0usize)];
+    let mut visited = std::collections::HashSet::new();
+    while let Some((parent_id, depth)) = stack.pop() {
+        if !parent_id.is_empty() && !visited.insert(parent_id.clone()) {
+            continue;
+        }
+        for entry in list_all(client, &parent_id).await? {
+            if entry.name == name && size.is_none_or(|wanted| entry.size.unwrap_or(0) == wanted) {
+                matches.push(entry.clone());
+            }
+            if entry.is_folder() && depth < max_depth {
+                stack.push((entry.id.clone(), depth + 1));
+            }
+        }
+    }
+    Ok(matches)
 }

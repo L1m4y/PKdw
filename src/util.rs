@@ -117,12 +117,47 @@ pub fn sanitize_filename(name: &str) -> String {
         }
     }
     let trimmed = out.trim().trim_end_matches('.').trim();
-    let candidate = if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+    let base = if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         "file".to_string()
     } else {
         trimmed.to_string()
     };
-    candidate.chars().take(180).collect()
+
+    // Preserve an extension and bound the resulting UTF-8 byte length.
+    let (stem, extension) = match base.rfind('.') {
+        Some(index) if index > 0 => (&base[..index], &base[index..]),
+        _ => (base.as_str(), ""),
+    };
+
+    let mut result = String::new();
+    let limit = 180usize;
+    let extension_bytes = extension.len();
+    for ch in stem.chars() {
+        if result.len() + ch.len_utf8() + extension_bytes > limit {
+            break;
+        }
+        result.push(ch);
+    }
+    if result.is_empty() {
+        result.push('f');
+        result.push('i');
+        result.push('l');
+        result.push('e');
+    }
+
+    let mut candidate = format!("{result}{extension}");
+
+    // Windows reserves certain file names regardless of extension.
+    let stem_for_windows = result.to_ascii_uppercase();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem_for_windows.as_str()) {
+        candidate.push('_');
+    }
+
+    candidate
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -188,6 +223,53 @@ pub fn size_from_str(value: Option<&str>) -> u64 {
 }
 
 /// Parse sizes returned as numbers, strings, or absent.
+pub fn de_optional_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct Lenient;
+    impl<'de> Visitor<'de> for Lenient {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a byte count as a number or decimal string")
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Option<u64>, E> {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Option<u64>, E> {
+            Ok(Some(value.max(0) as u64))
+        }
+
+        fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Option<u64>, E> {
+            Ok(Some(value.max(0.0) as u64))
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Option<u64>, E> {
+            Ok(value.parse().ok())
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Option<u64>, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_none<E: de::Error>(self) -> std::result::Result<Option<u64>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Option<u64>, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(Lenient)
+}
+
 pub fn de_lenient_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,

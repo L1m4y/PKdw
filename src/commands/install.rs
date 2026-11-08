@@ -1,8 +1,9 @@
 use crate::util::expand_tilde;
 use anyhow::{anyhow, Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub async fn run(destination: PathBuf, force: bool, quiet: bool) -> Result<i32> {
     let destination_dir = expand_tilde(&destination);
     let source = std::env::current_exe().context("cannot locate the pkdw executable")?;
@@ -38,38 +39,45 @@ pub async fn run(destination: PathBuf, force: bool, quiet: bool) -> Result<i32> 
                 source.display()
             )
         })?;
+
+        let on_path = is_on_path(&destination_dir);
+
+        if !quiet {
+            println!(
+                "installed: {} -> {}",
+                destination.display(),
+                source.display()
+            );
+            if !on_path {
+                println!(
+                    "note: {} is not in PATH. Add it with:\n  export PATH=\"{}:$PATH\"",
+                    destination_dir.display(),
+                    destination_dir.display()
+                );
+            } else {
+                println!("available as `pkdw`.");
+            }
+            println!(
+                "symlink keeps downloads and .env in the source tree:\n  {}",
+                source.parent().unwrap_or(&source).display()
+            );
+        }
+        let _ = source;
+        Ok(0)
     }
+
     #[cfg(not(unix))]
     {
-        return Err(anyhow!("install is currently only supported on Unix"));
+        // Keep the build portable on systems without Unix symlink semantics.
+        let _ = source;
+        return Err(anyhow!(
+            "pkdw install is currently only supported on Unix-like systems; use the binary directly"
+        ));
     }
-
-    let on_path = is_on_path(&destination_dir);
-
-    if !quiet {
-        println!(
-            "installed: {} -> {}",
-            destination.display(),
-            source.display()
-        );
-        if !on_path {
-            println!(
-                "note: {} is not in PATH. Add it with:\n  export PATH=\"{}:$PATH\"",
-                destination_dir.display(),
-                destination_dir.display()
-            );
-        } else {
-            println!("available as `pkdw`.");
-        }
-        println!(
-            "symlink keeps downloads and .env in the source tree:\n  {}",
-            source.parent().unwrap_or(&source).display()
-        );
-    }
-    Ok(0)
 }
 
-fn is_on_path(dir: &Path) -> bool {
+#[cfg(unix)]
+fn is_on_path(dir: &std::path::Path) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };

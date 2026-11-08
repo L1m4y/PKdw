@@ -117,9 +117,10 @@ async fn downloads_parallel_ranges_and_assembles_exact_file() {
         source,
         "test-file",
         "sample.bin",
-        payload.len() as u64,
+        Some(payload.len() as u64),
         dir.path(),
         &options(8, 64 * 1024),
+        "original",
     )
     .await
     .unwrap();
@@ -151,7 +152,7 @@ async fn resume_keeps_completed_ranges_and_skips_them() {
     std::fs::write(
         &state_path,
         format!(
-            r#"{{"version":1,"source_id":"resume-test","size":{total},"completed":[[0,{}]]}}"#,
+            r#"{{"version":1,"source_id":"resume-test","size":{total},"representation":"original","completed":[[0,{}]]}}"#,
             chunk - 1
         ),
     )
@@ -162,9 +163,10 @@ async fn resume_keeps_completed_ranges_and_skips_them() {
         source,
         "resume-test",
         "resume.bin",
-        total as u64,
+        Some(total as u64),
         dir.path(),
         &options(2, chunk as u64),
+        "original",
     )
     .await
     .unwrap();
