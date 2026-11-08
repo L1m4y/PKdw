@@ -663,6 +663,12 @@ async fn wait_for_new_drive_file(
 }
 
 fn is_fatal_auth_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<crate::api::client::RefreshError>()
+        .is_some()
+    {
+        return true;
+    }
     let text = format!("{error:#}");
     text.contains("not authenticated")
         || text.contains("token refresh failed")

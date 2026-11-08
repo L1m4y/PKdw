@@ -3,6 +3,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+/// Stable lock file path associated with a configuration or state file.
+pub fn lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
 /// Advisory interprocess lock. The lock file is stable and is never removed
 /// while another process might still hold it open.
 pub struct FileLock {
@@ -185,6 +192,22 @@ mod tests {
         atomic_write(&dest, b"two").unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn exclusive_lock_is_visible_to_other_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.lock");
+        let first = FileLock::acquire(&path).unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&second).is_err());
+        drop(first);
+        fs2::FileExt::try_lock_exclusive(&second).unwrap();
+        fs2::FileExt::unlock(&second).unwrap();
     }
 
     #[test]

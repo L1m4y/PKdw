@@ -15,6 +15,8 @@ pub const KEY_CLIENT_SECRET: &str = "PIKPAK_CLIENT_SECRET";
 pub struct ConfigFile {
     path: PathBuf,
     values: BTreeMap<String, String>,
+    #[cfg(test)]
+    fail_save_after: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl fmt::Debug for ConfigFile {
@@ -52,7 +54,18 @@ impl ConfigFile {
                     .with_context(|| format!("cannot read configuration file {}", path.display()));
             }
         }
-        Ok(Self { path, values })
+        Ok(Self {
+            path,
+            values,
+            #[cfg(test)]
+            fail_save_after: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn fail_save_after(&self, saves: usize) {
+        self.fail_save_after
+            .store(saves, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn path(&self) -> &Path {
@@ -87,6 +100,19 @@ impl ConfigFile {
     }
 
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let remaining = self.fail_save_after.load(Ordering::SeqCst);
+            if remaining > 0 {
+                if remaining == 1 {
+                    self.fail_save_after.store(0, Ordering::SeqCst);
+                    anyhow::bail!("injected config save failure");
+                }
+                self.fail_save_after.store(remaining - 1, Ordering::SeqCst);
+            }
+        }
+
         let existing = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),

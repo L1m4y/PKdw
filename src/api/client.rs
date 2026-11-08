@@ -46,6 +46,40 @@ struct CachedCaptcha {
     expires_at: Instant,
 }
 
+/// Typed failures of the single-use refresh-token rotation.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// The server explicitly rejected the token before consuming it. Rolling
+    /// back to the previously stored token is safe in this case.
+    RejectedBeforeRotation { message: String },
+    /// The server accepted the token and returned a new one, but it could not
+    /// be written to disk. The previous token may already be dead, so it must
+    /// never be restored.
+    RotatedButPersistenceFailed {
+        session: Box<Session>,
+        source: anyhow::Error,
+    },
+    /// A transient exchange failure (network, 5xx, malformed response). There
+    /// is no proof that the server rejected or rotated the token.
+    Failed { source: anyhow::Error },
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RejectedBeforeRotation { message } => f.write_str(message),
+            Self::RotatedButPersistenceFailed { source, .. } => write!(
+                f,
+                "PikPak rotated the refresh token but it could not be saved locally: {source:#}. \
+                 The new session is kept in memory; fix the configuration path and retry saving it."
+            ),
+            Self::Failed { source } => write!(f, "{source:#}"),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
 #[derive(Clone)]
 pub struct PikPak {
     http: reqwest::Client,
@@ -56,6 +90,9 @@ pub struct PikPak {
     captcha: Arc<Mutex<HashMap<String, CachedCaptcha>>>,
     auth_base: String,
     drive_base: String,
+    auth_lock: Arc<Mutex<()>>,
+    config_lock_path: std::path::PathBuf,
+    persistence_pending: Arc<Mutex<bool>>,
 }
 
 impl PikPak {
@@ -93,6 +130,7 @@ impl PikPak {
         let drive_base = std::env::var("PIKPAK_DRIVE_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_DRIVE_BASE.to_string());
 
+        let config_lock_path = crate::fsutil::lock_path(&paths.env_file);
         Ok(Self {
             http,
             paths,
@@ -102,6 +140,9 @@ impl PikPak {
             captcha: Arc::new(Mutex::new(HashMap::new())),
             auth_base,
             drive_base,
+            auth_lock: Arc::new(Mutex::new(())),
+            config_lock_path,
+            persistence_pending: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -129,17 +170,31 @@ impl PikPak {
     }
 
     pub async fn session(&self) -> Result<Option<Session>> {
-        if let Some(session) = self.session.lock().await.as_ref() {
-            if Instant::now() + ACCESS_REFRESH_MARGIN < session.expires_at {
-                return Ok(Some(session.clone()));
+        // Lock order: auth_lock -> config file lock -> config mutex. Never
+        // hold the session mutex while awaiting a refresh.
+        let _auth = self.auth_lock.lock().await;
+
+        if let Some(session) = self.valid_session().await {
+            if !*self.persistence_pending.lock().await {
+                return Ok(Some(session));
             }
         }
 
-        let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_ref() {
-            if Instant::now() + ACCESS_REFRESH_MARGIN < session.expires_at {
-                return Ok(Some(session.clone()));
+        let _file_lock = crate::fsutil::FileLock::acquire(&self.config_lock_path)?;
+
+        if *self.persistence_pending.lock().await {
+            if let Err(error) = self.persist_pending_session().await {
+                if let Some(session) = self.valid_session().await {
+                    // The access token is still usable. Keep serving requests
+                    // while the rotated refresh token awaits persistence.
+                    return Ok(Some(session));
+                }
+                return Err(error);
             }
+        }
+
+        if let Some(session) = self.valid_session().await {
+            return Ok(Some(session));
         }
 
         let refresh_token = {
@@ -152,9 +207,58 @@ impl PikPak {
             return Ok(None);
         };
 
-        let session = self.exchange_refresh_token(&refresh_token).await?;
-        *guard = Some(session.clone());
-        Ok(Some(session))
+        match self.exchange_refresh_token(&refresh_token).await {
+            Ok(session) => {
+                *self.session.lock().await = Some(session.clone());
+                Ok(Some(session))
+            }
+            Err(error @ RefreshError::RotatedButPersistenceFailed { .. }) => {
+                if let RefreshError::RotatedButPersistenceFailed { session, .. } = &error {
+                    *self.session.lock().await = Some(session.as_ref().clone());
+                }
+                *self.persistence_pending.lock().await = true;
+                Err(anyhow::Error::new(error))
+            }
+            Err(error) => Err(anyhow::Error::new(error)),
+        }
+    }
+
+    async fn valid_session(&self) -> Option<Session> {
+        let guard = self.session.lock().await;
+        guard
+            .as_ref()
+            .filter(|session| Instant::now() + ACCESS_REFRESH_MARGIN < session.expires_at)
+            .cloned()
+    }
+
+    async fn persist_pending_session(&self) -> Result<()> {
+        let token = self
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.refresh_token.clone())
+            .filter(|token| !token.is_empty());
+        let Some(token) = token else {
+            *self.persistence_pending.lock().await = false;
+            return Ok(());
+        };
+        {
+            let mut config = self.config.lock().await;
+            config.set(KEY_REFRESH_TOKEN, &token);
+            config
+                .save()
+                .context("cannot persist the rotated refresh token")?;
+        }
+        *self.persistence_pending.lock().await = false;
+        Ok(())
+    }
+
+    /// Retry writing a rotated token that could not be persisted earlier.
+    pub async fn retry_persist_rotated_token(&self) -> Result<()> {
+        let _auth = self.auth_lock.lock().await;
+        let _file_lock = crate::fsutil::FileLock::acquire(&self.config_lock_path)?;
+        self.persist_pending_session().await
     }
 
     pub async fn require_session(&self) -> Result<Session> {
@@ -172,6 +276,14 @@ impl PikPak {
             bail!("that is the placeholder token, not a real refresh token");
         }
 
+        let _auth = self.auth_lock.lock().await;
+        let _file_lock = crate::fsutil::FileLock::acquire(&self.config_lock_path)?;
+
+        // Never rotate again while a previous rotation is still unsaved.
+        if *self.persistence_pending.lock().await {
+            self.persist_pending_session().await?;
+        }
+
         let previous = {
             let config = self.config.lock().await;
             config.get(KEY_REFRESH_TOKEN).map(str::to_string)
@@ -179,7 +291,13 @@ impl PikPak {
         {
             let mut config = self.config.lock().await;
             config.set(KEY_REFRESH_TOKEN, token);
-            config.save()?;
+            if let Err(error) = config.save() {
+                match &previous {
+                    Some(previous) => config.set(KEY_REFRESH_TOKEN, previous),
+                    None => config.remove(KEY_REFRESH_TOKEN),
+                }
+                return Err(error).context("cannot save the refresh token before login");
+            }
         }
         *self.session.lock().await = None;
 
@@ -188,8 +306,9 @@ impl PikPak {
                 *self.session.lock().await = Some(session.clone());
                 Ok(session)
             }
-            Err(error) => {
-                // Do not replace a working token with one the server rejected.
+            Err(RefreshError::RejectedBeforeRotation { message }) => {
+                // The server did not consume this token. Restoring the previous
+                // one is safe and keeps a working login intact.
                 let mut config = self.config.lock().await;
                 match previous {
                     Some(previous) => {
@@ -209,23 +328,46 @@ impl PikPak {
                         })?;
                     }
                 }
-                Err(error)
+                Err(anyhow!(message))
+            }
+            Err(error @ RefreshError::RotatedButPersistenceFailed { .. }) => {
+                if let RefreshError::RotatedButPersistenceFailed { session, .. } = &error {
+                    // The new token is valid and lives in memory. Keep it so a
+                    // later retry can persist it; never restore the old token.
+                    *self.session.lock().await = Some(session.as_ref().clone());
+                }
+                *self.persistence_pending.lock().await = true;
+                Err(anyhow::Error::new(error))
+            }
+            Err(error @ RefreshError::Failed { .. }) => {
+                // A transient failure is not proof of rejection. Keep the
+                // supplied token instead of resurrecting a possibly dead one.
+                Err(anyhow::Error::new(error))
             }
         }
     }
 
     pub async fn logout(&self) -> Result<()> {
-        // Lock order must match session(): session first, config second.
+        let _auth = self.auth_lock.lock().await;
+        let _file_lock = crate::fsutil::FileLock::acquire(&self.config_lock_path)?;
+        // Lock order: auth -> file -> session -> config.
         let mut session = self.session.lock().await;
         let mut config = self.config.lock().await;
         config.remove(KEY_REFRESH_TOKEN);
         config.save()?;
         *session = None;
+        drop(config);
+        drop(session);
+        *self.persistence_pending.lock().await = false;
         Ok(())
     }
 
-    async fn exchange_refresh_token(&self, refresh_token: &str) -> Result<Session> {
-        let mut last_error: Option<anyhow::Error> = None;
+    async fn exchange_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> std::result::Result<Session, RefreshError> {
+        let mut last_rejection: Option<anyhow::Error> = None;
+        let mut last_failure: Option<anyhow::Error> = None;
 
         for profile in PROFILES {
             match self.try_exchange(refresh_token, *profile).await {
@@ -235,10 +377,11 @@ impl PikPak {
                         config.set(KEY_REFRESH_TOKEN, &session.refresh_token);
                         // A rotated token must be persisted before any other
                         // request can use or replace it.
-                        if let Err(error) = config.save() {
-                            return Err(anyhow!(
-                                "could not persist the rotated refresh token: {error:#}"
-                            ));
+                        if let Err(source) = config.save() {
+                            return Err(RefreshError::RotatedButPersistenceFailed {
+                                session: Box::new(session),
+                                source,
+                            });
                         }
                     }
                     if let Some(aud) = jwt_aud(&session.access_token) {
@@ -248,16 +391,35 @@ impl PikPak {
                     }
                     return Ok(session);
                 }
-                Err(error) => {
-                    last_error = Some(error);
+                Err(ExchangeFailure::Rejected(error)) => {
+                    last_rejection = Some(error);
+                }
+                Err(ExchangeFailure::Failed(error)) => {
+                    last_failure = Some(error);
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("token refresh failed")))
+        // A transient failure means the token may have been consumed without
+        // us seeing the response. Do not claim it was rejected.
+        if let Some(source) = last_failure {
+            return Err(RefreshError::Failed { source });
+        }
+        if let Some(error) = last_rejection {
+            return Err(RefreshError::RejectedBeforeRotation {
+                message: format!("{error:#}"),
+            });
+        }
+        Err(RefreshError::RejectedBeforeRotation {
+            message: "token refresh failed".to_string(),
+        })
     }
 
-    async fn try_exchange(&self, refresh_token: &str, profile: Profile) -> Result<Session> {
+    async fn try_exchange(
+        &self,
+        refresh_token: &str,
+        profile: Profile,
+    ) -> std::result::Result<Session, ExchangeFailure> {
         let url = format!("{}/v1/auth/token", self.auth_base);
         let response = self
             .http
@@ -271,31 +433,44 @@ impl PikPak {
             }))
             .send()
             .await
-            .with_context(|| format!("token refresh request failed ({})", profile.name))?;
+            .map_err(|error| {
+                ExchangeFailure::Failed(anyhow!(
+                    "token refresh request failed ({}): {error}",
+                    profile.name
+                ))
+            })?;
 
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            if is_grant_rejection(&text) {
-                bail!(
+            let detail = redact(&truncate(&text, 500), refresh_token);
+            if is_grant_rejection(&text) || status == StatusCode::UNAUTHORIZED {
+                return Err(ExchangeFailure::Rejected(anyhow!(
                     "PikPak rejected the refresh token for the {} client (invalid_grant). \
                      Refresh tokens are single-use: every login rotates them, so the web app \
                      or an older copy of pkdw may have already replaced this one. Copy a fresh \
                      token from the browser and run `pkdw auth --from-clipboard` again.",
                     profile.name
-                );
+                )));
             }
-            bail!(
-                "token refresh failed for the {} client (HTTP {status}): {}",
-                profile.name,
-                redact(&truncate(&text, 500), refresh_token)
-            );
+            if status == StatusCode::FORBIDDEN {
+                return Err(ExchangeFailure::Rejected(anyhow!(
+                    "token refresh was denied for the {} client (HTTP {status}): {detail}",
+                    profile.name
+                )));
+            }
+            return Err(ExchangeFailure::Failed(anyhow!(
+                "token refresh failed for the {} client (HTTP {status}): {detail}",
+                profile.name
+            )));
         }
 
         let token: TokenResponse =
-            serde_json::from_str(&text).context("invalid token response JSON")?;
+            serde_json::from_str(&text).map_err(|error| ExchangeFailure::Failed(error.into()))?;
         if token.access_token.is_empty() {
-            bail!("token refresh returned an empty access token");
+            return Err(ExchangeFailure::Failed(anyhow!(
+                "token refresh returned an empty access token"
+            )));
         }
         let ttl = if token.expires_in == 0 {
             3600
@@ -545,6 +720,11 @@ impl PikPak {
     }
 }
 
+enum ExchangeFailure {
+    Rejected(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -647,3 +827,180 @@ fn redact(value: &str, secret: &str) -> String {
 
 /// A cheap handle that can be cloned into concurrent download workers.
 pub type SharedClient = Arc<PikPak>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn spawn_oauth(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 8192];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    fn http_json(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn token_body(refresh: &str) -> String {
+        serde_json::json!({
+            "access_token": "access-token",
+            "refresh_token": refresh,
+            "expires_in": 3600,
+            "sub": "user-1"
+        })
+        .to_string()
+    }
+
+    fn test_client(dir: &std::path::Path, auth_base: String) -> PikPak {
+        let env_file = dir.join(".env");
+        let config = ConfigFile::load(env_file.clone()).unwrap();
+        let paths = Paths {
+            program_dir: dir.to_path_buf(),
+            downloads_dir: dir.join("downloads"),
+            env_file,
+        };
+        let config_lock_path = crate::fsutil::lock_path(&paths.env_file);
+        PikPak {
+            http: reqwest::Client::new(),
+            paths,
+            config: Arc::new(Mutex::new(config)),
+            device_id: "test-device".to_string(),
+            session: Arc::new(Mutex::new(None)),
+            captcha: Arc::new(Mutex::new(HashMap::new())),
+            auth_base,
+            drive_base: "http://127.0.0.1:9".to_string(),
+            auth_lock: Arc::new(Mutex::new(())),
+            config_lock_path,
+            persistence_pending: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_token_restores_the_previous_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_base, requests) = spawn_oauth(vec![
+            http_json(
+                "400 Bad Request",
+                r#"{"error":"invalid_grant","error_code":4126}"#,
+            ),
+            http_json(
+                "400 Bad Request",
+                r#"{"error":"invalid_grant","error_code":4126}"#,
+            ),
+        ])
+        .await;
+        let client = test_client(dir.path(), auth_base);
+        {
+            let mut config = client.config.lock().await;
+            config.set(KEY_REFRESH_TOKEN, "previous");
+            config.save().unwrap();
+        }
+
+        let error = client.login_with_token("rejected").await.unwrap_err();
+        assert!(format!("{error:#}").contains("invalid_grant"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client.config_file().await.get(KEY_REFRESH_TOKEN),
+            Some("previous")
+        );
+    }
+
+    #[tokio::test]
+    async fn rotated_token_is_persisted_before_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_base, requests) =
+            spawn_oauth(vec![http_json("200 OK", &token_body("rotated"))]).await;
+        let client = test_client(dir.path(), auth_base);
+        {
+            let mut config = client.config.lock().await;
+            config.set(KEY_REFRESH_TOKEN, "old");
+            config.save().unwrap();
+        }
+
+        let session = client.login_with_token("old").await.unwrap();
+        assert_eq!(session.refresh_token, "rotated");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.config_file().await.get(KEY_REFRESH_TOKEN),
+            Some("rotated")
+        );
+        let disk = ConfigFile::load(dir.path().join(".env")).unwrap();
+        assert_eq!(disk.get(KEY_REFRESH_TOKEN), Some("rotated"));
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_keeps_the_rotated_session_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_base, _) = spawn_oauth(vec![http_json("200 OK", &token_body("rotated"))]).await;
+        let client = test_client(dir.path(), auth_base);
+        {
+            let mut config = client.config.lock().await;
+            config.set(KEY_REFRESH_TOKEN, "old");
+            config.save().unwrap();
+            // The login save succeeds; the rotated-token save fails.
+            config.fail_save_after(2);
+        }
+
+        let error = client.login_with_token("old").await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("rotated the refresh token"), "{text}");
+        assert_eq!(
+            client.config_file().await.get(KEY_REFRESH_TOKEN),
+            Some("rotated")
+        );
+        assert!(client.session.lock().await.is_some());
+        assert!(*client.persistence_pending.lock().await);
+        let disk = ConfigFile::load(dir.path().join(".env")).unwrap();
+        assert_eq!(disk.get(KEY_REFRESH_TOKEN), Some("old"));
+
+        client.retry_persist_rotated_token().await.unwrap();
+        assert!(!*client.persistence_pending.lock().await);
+        let disk = ConfigFile::load(dir.path().join(".env")).unwrap();
+        assert_eq!(disk.get(KEY_REFRESH_TOKEN), Some("rotated"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_calls_consume_one_refresh_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_base, requests) =
+            spawn_oauth(vec![http_json("200 OK", &token_body("rotated"))]).await;
+        let client = test_client(dir.path(), auth_base);
+        {
+            let mut config = client.config.lock().await;
+            config.set(KEY_REFRESH_TOKEN, "old");
+            config.save().unwrap();
+        }
+
+        let first = client.clone();
+        let second = client.clone();
+        let (a, b) = tokio::join!(first.session(), second.session());
+        assert!(a.unwrap().is_some());
+        assert!(b.unwrap().is_some());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.config_file().await.get(KEY_REFRESH_TOKEN),
+            Some("rotated")
+        );
+    }
+}
