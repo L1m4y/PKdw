@@ -107,6 +107,20 @@ fn is_identifier(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+pub const MAX_COMPONENT_BYTES: usize = 180;
+
+/// Truncate a UTF-8 string without splitting a character.
+pub fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 pub fn sanitize_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -123,49 +137,58 @@ pub fn sanitize_filename(name: &str) -> String {
         trimmed.to_string()
     };
 
-    // Preserve an extension and bound the resulting UTF-8 byte length.
-    let (stem, extension) = match base.rfind('.') {
+    let (raw_stem, raw_extension) = match base.rfind('.') {
         Some(index) if index > 0 => (&base[..index], &base[index..]),
         _ => (base.as_str(), ""),
     };
+    let stem = raw_stem.trim_end_matches([' ', '.']);
 
-    let mut result = String::new();
-    let limit = 180usize;
-    let extension_bytes = extension.len();
-    for ch in stem.chars() {
-        if result.len() + ch.len_utf8() + extension_bytes > limit {
-            break;
-        }
-        result.push(ch);
+    // Keep useful extensions but never let one consume the whole component.
+    let extension = if raw_extension.len() <= 64 {
+        raw_extension
+    } else {
+        truncate_utf8(raw_extension, 64)
+    };
+    let extension = if extension == "." { "" } else { extension };
+
+    let mut stem_budget = MAX_COMPONENT_BYTES.saturating_sub(extension.len());
+    if stem_budget == 0 {
+        stem_budget = MAX_COMPONENT_BYTES;
     }
+    let mut result = truncate_utf8(stem, stem_budget).to_string();
     if result.is_empty() {
-        result.push('f');
-        result.push('i');
-        result.push('l');
-        result.push('e');
+        result.push_str("file");
+    }
+
+    // Windows reserves device names regardless of extension, and the rule
+    // applies to the first dot-separated component (`NUL.tar.gz` is reserved).
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM¹",
+        "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
+    ];
+    let first_component = result.split('.').next().unwrap_or(&result);
+    if RESERVED.contains(&first_component.to_uppercase().as_str()) {
+        // Alter the reserved first component, not just the end of the stem:
+        // `NUL.tar.gz` must become `NUL_.tar.gz`, never still start with `NUL.`.
+        let mut parts = result.splitn(2, '.');
+        let first = parts.next().unwrap_or_default();
+        let altered = match parts.next() {
+            Some(rest) => format!("{first}_.{rest}"),
+            None => format!("{first}_"),
+        };
+        let budget = MAX_COMPONENT_BYTES.saturating_sub(extension.len());
+        result = truncate_utf8(&altered, budget).to_string();
+        if result.is_empty() {
+            result.push('f');
+        }
     }
 
     let mut candidate = format!("{result}{extension}");
-
-    // Windows reserves certain file names regardless of extension. The
-    // alteration goes in the stem, before the dot; `CON.txt_` is still
-    // treated specially by Windows.
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if RESERVED.contains(&result.to_ascii_uppercase().as_str()) {
-        candidate = format!("{}_{extension}", result)
-            .trim_end_matches(|c: char| c.is_whitespace())
-            .to_string();
-        if candidate.len() > 180 {
-            // Remove the extension if necessary to preserve the limit on full
-            // byte length. The trailing marker keeps the name from colliding.
-            candidate = format!("{}_", result);
-            candidate.truncate(180);
-        }
+    if candidate.len() > MAX_COMPONENT_BYTES {
+        let keep = MAX_COMPONENT_BYTES.saturating_sub(extension.len());
+        candidate = format!("{}{extension}", truncate_utf8(&result, keep));
     }
-
     candidate
 }
 
@@ -404,6 +427,31 @@ mod tests {
         assert_eq!(sanitize_filename("a/b\\c:d*e?f"), "a_b_c_d_e_f");
         assert_eq!(sanitize_filename(".."), "file");
         assert_eq!(sanitize_filename(""), "file");
+    }
+
+    #[test]
+    fn bounds_long_names_and_extensions() {
+        let long_ascii = "a".repeat(300);
+        assert_eq!(sanitize_filename(&long_ascii).len(), MAX_COMPONENT_BYTES);
+
+        let long_extension = format!("file.{}", "x".repeat(300));
+        let sanitized = sanitize_filename(&long_extension);
+        assert!(sanitized.len() <= MAX_COMPONENT_BYTES, "{sanitized:?}");
+
+        for name in ["ñ".repeat(200), "😀".repeat(100)] {
+            let sanitized = sanitize_filename(&name);
+            assert!(sanitized.len() <= MAX_COMPONENT_BYTES);
+            assert!(sanitized.is_char_boundary(sanitized.len()));
+        }
+    }
+
+    #[test]
+    fn escapes_windows_reserved_device_names() {
+        assert_eq!(sanitize_filename("CON.txt"), "CON_.txt");
+        assert_eq!(sanitize_filename("NUL.tar.gz"), "NUL_.tar.gz");
+        assert_eq!(sanitize_filename("COM¹"), "COM¹_");
+        assert_eq!(sanitize_filename("COM².txt"), "COM²_.txt");
+        assert_eq!(sanitize_filename("LPT³.log"), "LPT³_.log");
     }
 
     #[test]

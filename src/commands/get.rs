@@ -56,7 +56,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
             let mut candidates =
                 share_candidates(client, &share_id, &token, file_id.as_deref(), output).await?;
             apply_filters(&mut candidates, args)?;
-            unique_names(&mut candidates);
+            unique_names(&mut candidates)?;
 
             if candidates.is_empty() {
                 bail!("no files matched the selected filters");
@@ -114,7 +114,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
                 }]
             };
             apply_filters(&mut candidates, args)?;
-            unique_names(&mut candidates);
+            unique_names(&mut candidates)?;
             if candidates.is_empty() {
                 bail!("no files matched the selected filters");
             }
@@ -746,29 +746,48 @@ async fn out_dir_ready(path: &Path) -> Result<()> {
         .map_err(|error| anyhow!("cannot create {}: {error}", path.display()))
 }
 
-fn unique_names(candidates: &mut [Candidate]) {
+fn unique_names(candidates: &mut [Candidate]) -> Result<()> {
     let mut used = std::collections::HashSet::new();
     for candidate in candidates {
-        candidate.name = unique_name(&mut used, &candidate.name);
+        candidate.name = unique_name(&mut used, &candidate.name)?;
     }
+    Ok(())
 }
 
-fn unique_name(used: &mut std::collections::HashSet<String>, name: &str) -> String {
+fn unique_name(used: &mut std::collections::HashSet<String>, name: &str) -> Result<String> {
     let base = crate::util::sanitize_filename(name);
-    if used.insert(base.clone()) {
-        return base;
+    if used.insert(base.to_lowercase()) {
+        return Ok(base);
     }
-    let (stem, ext) = match base.rsplit_once('.') {
-        Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),
-        None => (base.clone(), String::new()),
+
+    let (stem, extension) = match base.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (base.as_str(), String::new()),
     };
-    for index in 2.. {
-        let candidate = crate::util::sanitize_filename(&format!("{stem} ({index}){ext}"));
-        if used.insert(candidate.clone()) {
-            return candidate;
+
+    // Reserve room for the suffix and the extension before truncating the
+    // stem. Truncating first would eat the suffix and loop forever.
+    for index in 2..=100_000u32 {
+        let suffix = format!(" ({index})");
+        let extension = if suffix.len() + extension.len() >= crate::util::MAX_COMPONENT_BYTES {
+            String::new()
+        } else {
+            extension.clone()
+        };
+        let stem_budget =
+            crate::util::MAX_COMPONENT_BYTES.saturating_sub(suffix.len() + extension.len());
+        let stem = crate::util::truncate_utf8(stem, stem_budget);
+        let candidate = format!("{stem}{suffix}{extension}");
+        debug_assert!(candidate.len() <= crate::util::MAX_COMPONENT_BYTES);
+        if candidate == base {
+            continue;
+        }
+        if used.insert(candidate.to_lowercase()) {
+            return Ok(candidate);
         }
     }
-    base
+
+    bail!("cannot generate a unique filename for {name}")
 }
 
 fn finish_report(report: &Report, output: &OutputArgs) -> Result<i32> {
@@ -818,5 +837,46 @@ mod tests {
             "PikPak rejected the refresh token (invalid_grant)"
         )));
         assert!(!is_fatal_auth_error(&anyhow!("not enough drive space")));
+    }
+
+    #[test]
+    fn unique_names_terminate_for_long_ascii_names() {
+        let mut used = std::collections::HashSet::new();
+        let first = unique_name(&mut used, &"a".repeat(180)).unwrap();
+        let second = unique_name(&mut used, &"a".repeat(180)).unwrap();
+        assert_ne!(first, second);
+        assert!(first.len() <= crate::util::MAX_COMPONENT_BYTES);
+        assert!(second.len() <= crate::util::MAX_COMPONENT_BYTES);
+        assert!(second.contains(" (2)"));
+    }
+
+    #[test]
+    fn unique_names_keep_utf8_boundaries() {
+        let mut used = std::collections::HashSet::new();
+        let first = unique_name(&mut used, &"ñ😀".repeat(80)).unwrap();
+        let second = unique_name(&mut used, &"ñ😀".repeat(80)).unwrap();
+        assert_ne!(first, second);
+        assert!(first.len() <= crate::util::MAX_COMPONENT_BYTES);
+        assert!(second.len() <= crate::util::MAX_COMPONENT_BYTES);
+        assert!(std::str::from_utf8(second.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn unique_names_compare_case_insensitively() {
+        let mut used = std::collections::HashSet::new();
+        let first = unique_name(&mut used, "Movie.mkv").unwrap();
+        let second = unique_name(&mut used, "movie.mkv").unwrap();
+        assert_ne!(first.to_lowercase(), second.to_lowercase());
+    }
+
+    #[test]
+    fn unique_names_bound_overlong_extensions() {
+        let mut used = std::collections::HashSet::new();
+        let name = format!("movie.{}", "x".repeat(300));
+        let first = unique_name(&mut used, &name).unwrap();
+        let second = unique_name(&mut used, &name).unwrap();
+        assert_ne!(first, second);
+        assert!(first.len() <= crate::util::MAX_COMPONENT_BYTES);
+        assert!(second.len() <= crate::util::MAX_COMPONENT_BYTES);
     }
 }
