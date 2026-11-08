@@ -350,11 +350,6 @@ pub async fn download_file(
         );
     }
 
-    if size == 0 {
-        File::create(&dest)?;
-        return Ok(DownloadOutcome::Complete(dest));
-    }
-
     let state_existed = state_path.exists();
     let part_existed = part.exists();
     let mut state = match std::fs::read_to_string(&state_path) {
