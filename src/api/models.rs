@@ -123,7 +123,7 @@ pub struct SelectedMedia {
     pub url: String,
     pub label: String,
     pub is_original: bool,
-    pub expected_size: u64,
+    pub expected_size: Option<u64>,
 }
 
 impl FileInfo {
@@ -152,7 +152,7 @@ impl FileInfo {
                     url: media.url()?.to_string(),
                     label: "original".to_string(),
                     is_original: true,
-                    expected_size: media_size(media.url()?).unwrap_or(0),
+                    expected_size: media_size(media.url()?),
                 });
             }
         }
@@ -162,7 +162,7 @@ impl FileInfo {
                 url: self.web_content_link.clone(),
                 label: "original".to_string(),
                 is_original: true,
-                expected_size: self.size.unwrap_or(0),
+                expected_size: self.size,
             });
         }
 
@@ -184,7 +184,7 @@ impl FileInfo {
                     url: media.url()?.to_string(),
                     label: media.label().to_string(),
                     is_original: media.is_origin,
-                    expected_size: media_size(media.url()?).unwrap_or(0),
+                    expected_size: media_size(media.url()?),
                 });
             }
 
@@ -211,7 +211,7 @@ impl FileInfo {
                 url: media.url()?.to_string(),
                 label: media.label().to_string(),
                 is_original: media.is_origin,
-                expected_size: media_size(media.url()?).unwrap_or(0),
+                expected_size: media_size(media.url()?),
             });
         }
 
@@ -220,7 +220,7 @@ impl FileInfo {
                 url: self.web_content_link.clone(),
                 label: quality.key().to_string(),
                 is_original: quality == Quality::Original,
-                expected_size: self.size.unwrap_or(0),
+                expected_size: self.size,
             });
         }
         None
@@ -389,10 +389,12 @@ pub struct RestoreResponse {
 
 fn media_size(url: &str) -> Option<u64> {
     url.split('?').nth(1)?.split('&').find_map(|part| {
-        part.strip_prefix("f=")
+        part
+            .strip_prefix("f=")
             .and_then(|value| value.parse::<u64>().ok())
     })
 }
+
 
 #[cfg(test)]
 mod tests {

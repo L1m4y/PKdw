@@ -279,13 +279,23 @@ async fn download_shared(
             report.failed += 1;
             continue;
         };
-        let size = if selected.expected_size > 0 {
-            selected.expected_size
+        let has_selected_size = selected
+            .expected_size
+            .is_some_and(|value| value > 0);
+        let size = if has_selected_size {
+            selected.expected_size.unwrap()
         } else {
-            info.size
-                .unwrap_or(candidate.size.unwrap_or(0))
+            info.size.unwrap_or(candidate.size.unwrap_or(0))
                 .max(candidate.size.unwrap_or(0))
         };
+        if !has_selected_size
+            && info.size.is_none()
+            && candidate.size.is_none()
+        {
+            ui::warn(format!("{name}: PikPak did not report a usable file size"));
+            report.failed += 1;
+            continue;
+        }
 
         if !output.quiet {
             println!(
