@@ -3,6 +3,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod download;
+pub mod fsutil;
 pub mod paths;
 pub mod ui;
 pub mod util;

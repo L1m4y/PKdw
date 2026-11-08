@@ -139,19 +139,7 @@ impl ConfigFile {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create config directory {}", parent.display()))?;
         }
-        let file_name = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "env".to_string());
-        let tmp = self.path.with_file_name(format!("{file_name}.tmp"));
-        fs::write(&tmp, format!("{}\n", output.join("\n")))
-            .with_context(|| format!("cannot write config {}", tmp.display()))?;
-        restrict_permissions(&tmp)?;
-        fs::rename(&tmp, &self.path)
-            .with_context(|| format!("cannot replace config {}", self.path.display()))?;
-        restrict_permissions(&self.path)?;
-        Ok(())
+        crate::fsutil::atomic_write(&self.path, format!("{}\n", output.join("\n")).as_bytes())
     }
 }
 
@@ -165,20 +153,6 @@ fn unquote(value: &str) -> &str {
         }
     }
     value
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -211,5 +185,46 @@ mod tests {
         assert!(text.contains("A=9"));
         assert!(text.contains("B=2"));
         assert!(text.contains("C=3"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_private_and_leaves_no_temporary_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let mut config = ConfigFile::load(path.clone()).unwrap();
+        config.set(KEY_REFRESH_TOKEN, "secret");
+        config.save().unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_share_a_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, "# keep\nA=1\n").unwrap();
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut config = ConfigFile::load(path).unwrap();
+                config.set("THREAD", &index.to_string());
+                config.save().unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let config = ConfigFile::load(path.clone()).unwrap();
+        assert_eq!(config.get("A"), Some("1"));
+        assert!(config.get("THREAD").is_some());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
