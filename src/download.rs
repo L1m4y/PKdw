@@ -619,9 +619,7 @@ async fn fetch_range(
 
     let status = response.status();
     if status != StatusCode::PARTIAL_CONTENT {
-        bail!(
-            "range {start}-{end} was not delivered as 206 Partial Content (HTTP {status})"
-        );
+        bail!("range {start}-{end} was not delivered as 206 Partial Content (HTTP {status})");
     }
 
     let content_range = response

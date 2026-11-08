@@ -206,7 +206,11 @@ fn print_selection(candidates: &[Candidate], output: &OutputArgs) {
     }
     println!("{} file(s) selected:", candidates.len());
     for candidate in candidates {
-        println!("  {:>10}  {}", format_size(candidate.size.unwrap_or(0)), candidate.name);
+        println!(
+            "  {:>10}  {}",
+            format_size(candidate.size.unwrap_or(0)),
+            candidate.name
+        );
     }
     println!();
 }
@@ -278,7 +282,9 @@ async fn download_shared(
         let size = if selected.expected_size > 0 {
             selected.expected_size
         } else {
-            info.size.unwrap_or(candidate.size.unwrap_or(0)).max(candidate.size.unwrap_or(0))
+            info.size
+                .unwrap_or(candidate.size.unwrap_or(0))
+                .max(candidate.size.unwrap_or(0))
         };
 
         if !output.quiet {
