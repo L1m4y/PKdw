@@ -291,7 +291,22 @@ pub async fn download_file(
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("cannot create {}", dest_dir.display()))?;
-    let size = size.ok_or_else(|| anyhow!("{name}: PikPak did not report a usable file size"))?;
+    let known_size = size;
+    let unknown_size = known_size.is_none();
+    let size = if let Some(size) = known_size {
+        size
+    } else {
+        let url = source.link(true).await?;
+        let resolved = probe_content_length(&options.http, &url).await?;
+        // Refresh the link cache for the real segment requests.
+        let _ = source.link(true).await;
+        resolved
+    };
+
+    if unknown_size && size == 0 {
+        return Err(anyhow!("{name}: PikPak did not report a usable file size"));
+    }
+
     let dest = dest_dir.join(sanitize_filename(name));
     let part = append_suffix(&dest, ".part");
     let state_path = append_suffix(&dest, ".part.pkdw.json");
@@ -730,6 +745,58 @@ fn manifest_hash_ok(manifest_path: &Path, dest: &Path) -> bool {
         .map(|actual| actual == expected)
         .unwrap_or(false)
 }
+
+
+async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64> {
+    let response = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        .with_context(|| format!("cannot probe content length for {url}"))?;
+
+    let status = response.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let (_, _, total) = parse_content_range(content_range)?;
+        return total.ok_or_else(|| {
+            anyhow!("PikPak did not report a usable size while probing {url}")
+        });
+    }
+
+    if status != StatusCode::PARTIAL_CONTENT {
+        // Some CDNs ignore Range and answer 200. Keep this as a fallback
+        // hint, but only if it conservatively matches the declared total.
+        if let Some(length) = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Ok(length);
+        }
+        return Err(anyhow!(
+            "PikPak did not return 206 Partial Content while probing {url}"
+        ));
+    }
+
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("probe response has no Content-Range"))?;
+    let (_, actual_end, total) = parse_content_range(content_range)?;
+    if actual_end != 0 {
+        return Err(anyhow!("probe returned an unexpected range {actual_end}"));
+    }
+    total.ok_or_else(|| anyhow!("probe did not report a content total"))
+}
+
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
