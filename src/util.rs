@@ -147,14 +147,24 @@ pub fn sanitize_filename(name: &str) -> String {
 
     let mut candidate = format!("{result}{extension}");
 
-    // Windows reserves certain file names regardless of extension.
-    let stem_for_windows = result.to_ascii_uppercase();
+    // Windows reserves certain file names regardless of extension. The
+    // alteration goes in the stem, before the dot; `CON.txt_` is still
+    // treated specially by Windows.
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+        "LPT9",
     ];
-    if RESERVED.contains(&stem_for_windows.as_str()) {
-        candidate.push('_');
+    if RESERVED.contains(&result.to_ascii_uppercase().as_str()) {
+        candidate = format!("{}_{extension}", result)
+            .trim_end_matches(|c: char| c.is_whitespace())
+            .to_string();
+        if candidate.len() > 180 {
+            // Remove the extension if necessary to preserve the limit on full
+            // byte length. The trailing marker keeps the name from colliding.
+            candidate = format!("{}_", result);
+            candidate.truncate(180);
+        }
     }
 
     candidate
