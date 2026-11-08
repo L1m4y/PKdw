@@ -618,14 +618,10 @@ async fn fetch_range(
         .with_context(|| format!("range request {start}-{end} failed"))?;
 
     let status = response.status();
-    if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        bail!("range {start}-{end} is not available from the CDN (HTTP 416)");
-    }
-    if status == StatusCode::OK {
-        bail!("the CDN ignored the Range header for {start}-{end}");
-    }
-    if !status.is_success() {
-        bail!("range {start}-{end} failed (HTTP {status})");
+    if status != StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "range {start}-{end} was not delivered as 206 Partial Content (HTTP {status})"
+        );
     }
 
     let content_range = response
