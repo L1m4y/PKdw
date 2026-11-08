@@ -389,12 +389,10 @@ pub struct RestoreResponse {
 
 fn media_size(url: &str) -> Option<u64> {
     url.split('?').nth(1)?.split('&').find_map(|part| {
-        part
-            .strip_prefix("f=")
+        part.strip_prefix("f=")
             .and_then(|value| value.parse::<u64>().ok())
     })
 }
-
 
 #[cfg(test)]
 mod tests {

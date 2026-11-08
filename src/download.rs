@@ -746,7 +746,6 @@ fn manifest_hash_ok(manifest_path: &Path, dest: &Path) -> bool {
         .unwrap_or(false)
 }
 
-
 async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64> {
     let response = client
         .get(url)
@@ -764,9 +763,8 @@ async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         let (_, _, total) = parse_content_range(content_range)?;
-        return total.ok_or_else(|| {
-            anyhow!("PikPak did not report a usable size while probing {url}")
-        });
+        return total
+            .ok_or_else(|| anyhow!("PikPak did not report a usable size while probing {url}"));
     }
 
     if status != StatusCode::PARTIAL_CONTENT {
@@ -796,7 +794,6 @@ async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<u64
     }
     total.ok_or_else(|| anyhow!("probe did not report a content total"))
 }
-
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();

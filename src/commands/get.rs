@@ -376,8 +376,16 @@ async fn download_restored(
             )))
             .shared();
             let source_id = format!("share:{share_id}:{}", candidate.file_id);
-            match download_file(source, &source_id, &name, None, out_dir, options, args.quality.key())
-                .await
+            match download_file(
+                source,
+                &source_id,
+                &name,
+                None,
+                out_dir,
+                options,
+                args.quality.key(),
+            )
+            .await
             {
                 Ok(DownloadOutcome::Complete(_)) => report.complete += 1,
                 Ok(DownloadOutcome::Incomplete { .. }) => report.incomplete += 1,
