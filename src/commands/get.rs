@@ -19,7 +19,7 @@ const MIB: u64 = 1024 * 1024;
 struct Candidate {
     file_id: String,
     name: String,
-    size: u64,
+    size: Option<u64>,
     info: Option<FileInfo>,
 }
 
@@ -109,7 +109,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
                 vec![Candidate {
                     file_id: entry.id.clone(),
                     name: entry.name.clone(),
-                    size: entry.size.unwrap_or(0),
+                    size: entry.size,
                     info: None,
                 }]
             };
@@ -154,7 +154,7 @@ async fn share_candidates(
                 .map(|entry| Candidate {
                     file_id: entry.id,
                     name: entry.name,
-                    size: entry.size.unwrap_or(0),
+                    size: entry.size,
                     info: None,
                 })
                 .collect());
@@ -162,7 +162,7 @@ async fn share_candidates(
         return Ok(vec![Candidate {
             file_id: info.id.clone(),
             name: info.name.clone(),
-            size: info.size.unwrap_or(0),
+            size: info.size,
             info: Some(info),
         }]);
     }
@@ -174,7 +174,7 @@ async fn share_candidates(
         .map(|entry| Candidate {
             file_id: entry.id,
             name: entry.name,
-            size: entry.size.unwrap_or(0),
+            size: entry.size,
             info: None,
         })
         .collect())
@@ -187,15 +187,15 @@ fn apply_filters(candidates: &mut Vec<Candidate>, args: &GetArgs) -> Result<()> 
     }
     if args.min_size > 0 {
         let minimum = args.min_size.saturating_mul(MIB);
-        candidates.retain(|candidate| candidate.size >= minimum);
+        candidates.retain(|candidate| candidate.size.unwrap_or(0) >= minimum);
     }
     if args.largest && !candidates.is_empty() {
         let largest = candidates
             .iter()
-            .map(|candidate| candidate.size)
+            .map(|candidate| candidate.size.unwrap_or(0))
             .max()
             .unwrap_or(0);
-        candidates.retain(|candidate| candidate.size == largest);
+        candidates.retain(|candidate| candidate.size.unwrap_or(0) == largest);
     }
     Ok(())
 }
@@ -206,7 +206,7 @@ fn print_selection(candidates: &[Candidate], output: &OutputArgs) {
     }
     println!("{} file(s) selected:", candidates.len());
     for candidate in candidates {
-        println!("  {:>10}  {}", format_size(candidate.size), candidate.name);
+        println!("  {:>10}  {}", format_size(candidate.size.unwrap_or(0)), candidate.name);
     }
     println!();
 }
@@ -278,7 +278,7 @@ async fn download_shared(
         let size = if selected.expected_size > 0 {
             selected.expected_size
         } else {
-            info.size.unwrap_or(0).max(candidate.size)
+            info.size.unwrap_or(candidate.size.unwrap_or(0)).max(candidate.size.unwrap_or(0))
         };
 
         if !output.quiet {
@@ -351,7 +351,8 @@ async fn download_restored(
         } else {
             info.name.clone()
         };
-        let size = info.size.unwrap_or(0).max(candidate.size);
+        let known_size = info.size.or(candidate.size);
+        let size = known_size.unwrap_or(0).max(candidate.size.unwrap_or(0));
 
         if !output.quiet {
             println!(
@@ -403,7 +404,7 @@ async fn download_restored(
         }
 
         let mut restored = false;
-        let existing = drive::find_many_by_name(client, &name, Some(size), 5).await?;
+        let existing = drive::find_many_by_name(client, &name, known_size, 5).await?;
         if existing.len() > 1 {
             return Err(anyhow!(
                 "{name}: multiple drive files share the same name and size; refusing to guess"
@@ -426,7 +427,7 @@ async fn download_restored(
                 drive::wait_task(client, &task_id, Duration::from_secs(30 * 60)).await?;
             }
             restored = true;
-            wait_for_drive_file_excluding(client, &name, size, &[], Duration::from_secs(120))
+            wait_for_drive_file_excluding(client, &name, known_size, &[], Duration::from_secs(120))
                 .await?
         } else {
             existing.first().cloned()
@@ -480,13 +481,13 @@ async fn download_restored(
 async fn wait_for_drive_file_excluding(
     client: &PikPak,
     name: &str,
-    size: u64,
+    size: Option<u64>,
     excluded: &[String],
     timeout: Duration,
 ) -> Result<Option<DriveFile>> {
     let deadline = Instant::now() + timeout;
     loop {
-        let matches = drive::find_many_by_name(client, name, Some(size), 5).await?;
+        let matches = drive::find_many_by_name(client, name, Some(size.unwrap_or(0)), 5).await?;
         if let Some(file) = matches
             .into_iter()
             .find(|file| !excluded.iter().any(|id| id == &file.id))
@@ -516,7 +517,7 @@ async fn collect_drive_candidates(client: &PikPak, folder_id: &str) -> Result<Ve
                 out.push(Candidate {
                     file_id: entry.id,
                     name: entry.name,
-                    size: entry.size.unwrap_or(0),
+                    size: entry.size,
                     info: None,
                 });
             }
@@ -540,7 +541,7 @@ async fn download_drive(
                 index + 1,
                 candidates.len(),
                 candidate.name,
-                format_size(candidate.size)
+                format_size(candidate.size.unwrap_or(0))
             );
         }
         let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(DriveLinkSource::new(
@@ -552,7 +553,7 @@ async fn download_drive(
             source,
             &format!("drive:{}", candidate.file_id),
             &candidate.name,
-            Some(candidate.size),
+            Some(candidate.size.unwrap_or(0)),
             out_dir,
             options,
             "original",
