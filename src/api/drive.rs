@@ -262,3 +262,43 @@ pub async fn find_many_by_name(
     }
     Ok(matches)
 }
+
+pub async fn list_all_with_limit(
+    client: &PikPak,
+    parent_id: &str,
+    limit: u32,
+) -> Result<Vec<DriveFile>> {
+    let mut files = Vec::new();
+    let mut page_token = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pages = 0usize;
+    loop {
+        if pages > 10_000 {
+            bail!("too many pages while listing drive parent {}", parent_id);
+        }
+        let mut params = vec![
+            ("limit".to_string(), limit.to_string()),
+            ("thumbnail_size".to_string(), "SIZE_MEDIUM".to_string()),
+        ];
+        if !parent_id.is_empty() {
+            params.push(("parent_id".to_string(), parent_id.to_string()));
+        }
+        if !page_token.is_empty() {
+            if !seen.insert(page_token.clone()) {
+                bail!("drive listing repeated next_page_token: {page_token}");
+            }
+            params.push(("page_token".to_string(), page_token.clone()));
+        }
+        let page: DriveListResponse = client
+            .authed_json(reqwest::Method::GET, "/drive/v1/files", &params, None)
+            .await
+            .context("cannot list the drive")?;
+        files.extend(page.files);
+        page_token = page.next_page_token;
+        pages += 1;
+        if page_token.is_empty() {
+            break;
+        }
+    }
+    Ok(files)
+}

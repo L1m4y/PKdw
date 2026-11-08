@@ -18,10 +18,7 @@ pub async fn run(client: &PikPak, args: &LsArgs, output: &OutputArgs) -> Result<
 
     // Reuse the protected pagination used by drive::list_all. The manual
     // page-token loop here previously had no duplicate-token protection.
-    let mut entries = drive::list_all(client, &target.id).await?;
-    if entries.len() > usize::try_from(args.limit).unwrap_or(entries.len()) {
-        entries.truncate(args.limit as usize);
-    }
+    let mut entries = drive::list_all_with_limit(client, &target.id, args.limit).await?;
 
     entries.sort_by(|a, b| {
         b.is_folder()
