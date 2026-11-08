@@ -302,6 +302,7 @@ async fn download_shared(
         ));
         let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
         let source_id = format!("share:{share_id}:{}", candidate.file_id);
+        let representation = selected.label.clone();
 
         match download_file(
             source,
@@ -310,7 +311,7 @@ async fn download_shared(
             Some(size),
             out_dir,
             options,
-            quality.key(),
+            &representation,
         )
         .await
         {
@@ -380,6 +381,10 @@ async fn download_restored(
                 args.quality,
                 false,
             ));
+            let fallback_label = info
+                .select_media(args.quality)
+                .map(|media| media.label)
+                .unwrap_or_else(|| args.quality.key().to_string());
             let source: Arc<dyn LinkSource> = CachedLink::new(inner).shared();
             let source_id = format!("share:{share_id}:{}", candidate.file_id);
             match download_file(
@@ -389,7 +394,7 @@ async fn download_restored(
                 Some(size),
                 out_dir,
                 options,
-                args.quality.key(),
+                &fallback_label,
             )
             .await
             {
