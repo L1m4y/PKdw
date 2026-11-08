@@ -194,11 +194,19 @@ impl PikPak {
                 match previous {
                     Some(previous) => {
                         config.set(KEY_REFRESH_TOKEN, &previous);
-                        let _ = config.save();
+                        config.save().map_err(|save_error| {
+                            anyhow!(
+                                "could not restore the previous refresh token after a failed login: {save_error:#}"
+                            )
+                        })?;
                     }
                     None => {
                         config.remove(KEY_REFRESH_TOKEN);
-                        let _ = config.save();
+                        config.save().map_err(|save_error| {
+                            anyhow!(
+                                "could not remove the rejected refresh token after a failed login: {save_error:#}"
+                            )
+                        })?;
                     }
                 }
                 Err(error)
