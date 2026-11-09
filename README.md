@@ -90,10 +90,16 @@ Tokens are single-use and rotate on every exchange. PKdw persists each rotation 
 
 - `0` success, `1` hard failure, `2` incomplete data kept for resume.
 - `--overwrite` discards resume state and restarts a file.
+- `--min-size` excludes files whose size is unknown. `--largest` compares only
+  known sizes and fails when every candidate has an unknown size.
 - Changing `--chunk-size` is safe and may revisit a few boundary segments.
+- Resume without a strong HTTP validator restarts the affected file from
+  scratch instead of mixing bytes from two CDN links.
 - Anonymous shares can expose partial originals. Use a transcode or `--restore`
   when you need the complete file.
-- `.env` is stored with mode `0600` and is ignored by git.
+- On Unix, `.env` is created with mode `0600`; on Windows, protection comes
+  from the inherited ACLs of the user profile directory. `.env` is ignored by
+  git on both platforms.
 - PKdw uses PikPak endpoints directly; it cannot bypass server-side limits such as transfer quotas, anonymous share range caps, and connected-app throttling.
 
 ## Documentation

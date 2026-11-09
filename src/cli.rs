@@ -102,11 +102,12 @@ pub struct GetArgs {
     #[arg(short, long, value_enum, default_value_t = Quality::Original)]
     pub quality: Quality,
 
-    /// Download only the largest file in a share.
+    /// Download only the largest file with a known size in a share.
+    /// Fails if every candidate has an unknown size.
     #[arg(long)]
     pub largest: bool,
 
-    /// Skip files smaller than this many MiB.
+    /// Skip files smaller than this many MiB. Files with an unknown size are skipped.
     #[arg(long, value_name = "MIB", default_value_t = 0)]
     pub min_size: u64,
 

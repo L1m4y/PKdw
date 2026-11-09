@@ -361,7 +361,8 @@ numbers are a snapshot, not a fixed rule.
 
 - Never log access tokens or refresh tokens. PKdw redacts the refresh token from
   server error text.
-- `.env` is written atomically with mode `0600`.
+- On Unix, `.env` is written atomically with mode `0600`. On Windows the file
+  relies on the inherited ACLs of the user profile directory.
 - Access tokens live only in memory. Refresh tokens rotate on every exchange and
   are persisted immediately.
 - The browser and the CLI must not use the same refresh token concurrently.

@@ -37,7 +37,7 @@ pub async fn run(client: &PikPak, args: &GetArgs, output: &OutputArgs) -> Result
         None => client.paths().downloads_dir.clone(),
     };
     let options = DownloadOptions {
-        http: client.http().clone(),
+        http: client.http_range().clone(),
         connections: args.connections as usize,
         chunk_size: args.chunk_size * MIB,
         rounds: args.rounds,
@@ -187,17 +187,28 @@ fn apply_filters(candidates: &mut Vec<Candidate>, args: &GetArgs) -> Result<()> 
     }
     if args.min_size > 0 {
         let minimum = args.min_size.saturating_mul(MIB);
-        candidates.retain(|candidate| candidate.size.unwrap_or(0) >= minimum);
+        // Unknown sizes can never satisfy a minimum.
+        candidates.retain(|candidate| candidate.size.is_some_and(|size| size >= minimum));
     }
     if args.largest && !candidates.is_empty() {
-        let largest = candidates
+        let known_sizes: Vec<u64> = candidates
             .iter()
-            .map(|candidate| candidate.size.unwrap_or(0))
-            .max()
-            .unwrap_or(0);
-        candidates.retain(|candidate| candidate.size.unwrap_or(0) == largest);
+            .filter_map(|candidate| candidate.size)
+            .collect();
+        if known_sizes.is_empty() {
+            return Err(anyhow!(
+                "cannot select largest item: all candidates have an unknown size"
+            ));
+        }
+        let largest = known_sizes.into_iter().max().unwrap_or(0);
+        candidates.retain(|candidate| candidate.size == Some(largest));
     }
     Ok(())
+}
+
+fn optional_size_label(size: Option<u64>) -> String {
+    size.map(format_size)
+        .unwrap_or_else(|| "unknown size".to_string())
 }
 
 fn print_selection(candidates: &[Candidate], output: &OutputArgs) {
@@ -208,7 +219,7 @@ fn print_selection(candidates: &[Candidate], output: &OutputArgs) {
     for candidate in candidates {
         println!(
             "  {:>10}  {}",
-            format_size(candidate.size.unwrap_or(0)),
+            optional_size_label(candidate.size),
             candidate.name
         );
     }
@@ -716,7 +727,7 @@ async fn download_drive(
                 index + 1,
                 candidates.len(),
                 candidate.name,
-                format_size(candidate.size.unwrap_or(0))
+                optional_size_label(candidate.size)
             );
         }
         let source: Arc<dyn LinkSource> = CachedLink::new(Arc::new(DriveLinkSource::new(
@@ -832,6 +843,78 @@ mod tests {
         assert!(!sizes_conflict(None, Some(10)));
         assert!(!sizes_conflict(None, None));
         assert!(sizes_conflict(Some(10), Some(11)));
+    }
+
+    fn filter_args(min_size: u64, largest: bool) -> GetArgs {
+        GetArgs {
+            target: "share".to_string(),
+            output: None,
+            quality: Quality::Original,
+            largest,
+            min_size,
+            name: None,
+            pass_code: None,
+            restore: false,
+            delete_after: false,
+            connections: 16,
+            chunk_size: 16,
+            rounds: 3,
+            overwrite: false,
+            dry_run: false,
+        }
+    }
+
+    fn sized_candidate(name: &str, size: Option<u64>) -> Candidate {
+        Candidate {
+            file_id: name.to_string(),
+            name: name.to_string(),
+            size,
+            info: None,
+        }
+    }
+
+    #[test]
+    fn minimum_size_excludes_unknown_and_smaller_files() {
+        let mut candidates = vec![
+            sized_candidate("unknown.bin", None),
+            sized_candidate("small.bin", Some(1024)),
+            sized_candidate("exact.bin", Some(2 * MIB)),
+            sized_candidate("large.bin", Some(3 * MIB)),
+        ];
+        apply_filters(&mut candidates, &filter_args(2, false)).unwrap();
+        let names: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.name)
+            .collect();
+        assert_eq!(names, vec!["exact.bin", "large.bin"]);
+    }
+
+    #[test]
+    fn largest_uses_known_sizes_only() {
+        let mut candidates = vec![
+            sized_candidate("unknown.bin", None),
+            sized_candidate("known-small.bin", Some(1024)),
+            sized_candidate("known-large.bin", Some(4096)),
+        ];
+        apply_filters(&mut candidates, &filter_args(0, true)).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "known-large.bin");
+    }
+
+    #[test]
+    fn largest_fails_when_every_size_is_unknown() {
+        let mut candidates = vec![
+            sized_candidate("first.bin", None),
+            sized_candidate("second.bin", None),
+        ];
+        let error = apply_filters(&mut candidates, &filter_args(0, true)).unwrap_err();
+        assert!(error.to_string().contains("unknown size"));
+    }
+
+    #[test]
+    fn unknown_sizes_are_printed_as_unknown() {
+        assert_eq!(optional_size_label(None), "unknown size");
+        assert_eq!(optional_size_label(Some(0)), "0 B");
     }
 
     #[test]
