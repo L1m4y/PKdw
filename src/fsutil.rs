@@ -147,19 +147,33 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write a fully synced unique temporary file and return its path. The caller
+/// is responsible for replacing the destination or removing the temporary.
+pub fn write_temp_file(dest: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let (tmp, mut file) = create_unique_temp(dest)?;
+    let result = file
+        .write_all(bytes)
+        .with_context(|| format!("cannot write temporary file {}", tmp.display()))
+        .and_then(|_| {
+            file.sync_all()
+                .with_context(|| format!("cannot sync temporary file {}", tmp.display()))
+        });
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(tmp)
+}
+
 /// Write `bytes` to a unique temporary file, fsync it and atomically replace
 /// `dest`. The temporary file is removed on every error path.
 pub fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<()> {
-    let (tmp, mut file) = create_unique_temp(dest)?;
+    let tmp = write_temp_file(dest, bytes)?;
     let mut guard = TempGuard {
         path: tmp.clone(),
         committed: false,
     };
-    file.write_all(bytes)
-        .with_context(|| format!("cannot write temporary file {}", tmp.display()))?;
-    file.sync_all()
-        .with_context(|| format!("cannot sync temporary file {}", tmp.display()))?;
-    drop(file);
     replace_file(&tmp, dest)?;
     guard.committed = true;
     sync_parent_dir(dest)?;

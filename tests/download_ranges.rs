@@ -23,7 +23,7 @@ impl LinkSource for MockSource {
 
 type RangeLog = Arc<Mutex<Vec<(usize, usize)>>>;
 
-async fn spawn_range_server(payload: Vec<u8>) -> (String, RangeLog) {
+async fn spawn_range_server(payload: Vec<u8>, etag: Option<&'static str>) -> (String, RangeLog) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let payload = Arc::new(payload);
@@ -80,8 +80,11 @@ async fn spawn_range_server(payload: Vec<u8>) -> (String, RangeLog) {
                     let end: usize = end.parse::<usize>().unwrap().min(payload.len() - 1);
                     log.lock().unwrap().push((start, end));
                     let body = &payload[start..=end];
+                    let validator = etag
+                        .map(|etag| format!("ETag: {etag}\r\n"))
+                        .unwrap_or_default();
                     let headers = format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\n{validator}Connection: close\r\n\r\n",
                         body.len(),
                         start,
                         end,
@@ -113,7 +116,7 @@ async fn downloads_parallel_ranges_and_assembles_exact_file() {
     let payload: Vec<u8> = (0..(1024 * 1024 + 123))
         .map(|index| (index % 251) as u8)
         .collect();
-    let (url, _log) = spawn_range_server(payload.clone()).await;
+    let (url, _log) = spawn_range_server(payload.clone(), Some("\"stable-v1\"")).await;
 
     let dir = tempfile::tempdir().unwrap();
     let source: Arc<dyn LinkSource> = Arc::new(MockSource { url });
@@ -146,7 +149,7 @@ async fn resume_keeps_completed_ranges_and_skips_them() {
     let chunk = 1024 * 1024usize;
     let total = 4 * chunk;
     let payload: Vec<u8> = (0..total).map(|index| (index % 239) as u8).collect();
-    let (url, log) = spawn_range_server(payload.clone()).await;
+    let (url, log) = spawn_range_server(payload.clone(), Some("\"stable-v1\"")).await;
     let dir = tempfile::tempdir().unwrap();
 
     let part = dir.path().join("resume.bin.part");
@@ -195,6 +198,59 @@ async fn resume_keeps_completed_ranges_and_skips_them() {
     assert!(!part.exists());
 }
 
+#[tokio::test]
+async fn resume_without_a_strong_validator_discards_previous_ranges() {
+    let chunk = 1024 * 1024usize;
+    let total = 4 * chunk;
+    let payload: Vec<u8> = (0..total).map(|index| (index % 241) as u8).collect();
+    let (url, log) = spawn_range_server(payload.clone(), None).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let part = dir.path().join("unverifiable.bin.part");
+    let state_path = dir.path().join("unverifiable.bin.part.pkdw.json");
+    let mut sparse = vec![0u8; total];
+    sparse[..chunk].copy_from_slice(&payload[..chunk]);
+    std::fs::write(&part, &sparse).unwrap();
+    std::fs::write(
+        &state_path,
+        format!(
+            r#"{{"version":1,"source_id":"unverifiable-test","size":{total},"representation":"original","completed":[[0,{}]]}}"#,
+            chunk - 1
+        ),
+    )
+    .unwrap();
+
+    let source: Arc<dyn LinkSource> = Arc::new(MockSource { url });
+    let media = ResolvedMedia::drive(Some(total as u64));
+    let result = download_file(
+        source,
+        "unverifiable-test",
+        "unverifiable.bin",
+        &media,
+        dir.path(),
+        &options(2, chunk as u64),
+    )
+    .await
+    .unwrap();
+
+    match result {
+        DownloadOutcome::Complete(path) => {
+            assert_eq!(std::fs::read(path).unwrap(), payload);
+        }
+        DownloadOutcome::Incomplete { .. } => panic!("download should have completed"),
+    }
+
+    let requested = log.lock().unwrap().clone();
+    assert!(
+        requested
+            .iter()
+            .any(|(start, end)| *start == 0 && *end == chunk - 1),
+        "the sidecar range was trusted without a validator: {requested:?}"
+    );
+    assert!(!state_path.exists());
+    assert!(!part.exists());
+}
+
 #[test]
 fn quality_keys_are_stable() {
     assert_eq!(Quality::Original.key(), "original");
@@ -204,7 +260,7 @@ fn quality_keys_are_stable() {
 #[tokio::test]
 async fn refuses_a_probe_size_that_differs_from_the_selection() {
     let payload: Vec<u8> = (0..6).map(|index| index as u8).collect();
-    let (url, _log) = spawn_range_server(payload).await;
+    let (url, _log) = spawn_range_server(payload, Some("\"stable-v1\"")).await;
     let dir = tempfile::tempdir().unwrap();
     let source: Arc<dyn LinkSource> = Arc::new(MockSource { url });
     let media = ResolvedMedia::drive(Some(5));

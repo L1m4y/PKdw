@@ -83,6 +83,7 @@ impl std::error::Error for RefreshError {}
 #[derive(Clone)]
 pub struct PikPak {
     http: reqwest::Client,
+    http_range: reqwest::Client,
     paths: Paths,
     config: Arc<Mutex<ConfigFile>>,
     device_id: String,
@@ -110,21 +111,32 @@ impl PikPak {
         };
 
         let proxy = config.get_with_env(KEY_PROXY);
-        let mut builder = reqwest::Client::builder()
-            .user_agent("ANDROID-com.pikcloud.pikpak/1.21.0")
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(300))
-            .pool_max_idle_per_host(64)
-            .redirect(reqwest::redirect::Policy::limited(10));
 
-        if let Some(proxy) = proxy.filter(|value| !value.trim().is_empty()) {
-            builder = builder.proxy(
-                reqwest::Proxy::all(proxy.trim())
-                    .with_context(|| format!("invalid proxy URL in {KEY_PROXY}"))?,
-            );
+        fn build_client(proxy: Option<String>, no_gzip: bool) -> Result<reqwest::Client> {
+            let mut builder = reqwest::Client::builder()
+                .user_agent("ANDROID-com.pikcloud.pikpak/1.21.0")
+                .connect_timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(300))
+                .pool_max_idle_per_host(64)
+                .redirect(reqwest::redirect::Policy::limited(10));
+            if no_gzip {
+                builder = builder.no_gzip();
+            }
+            if let Some(proxy) = proxy
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+            {
+                builder = builder.proxy(
+                    reqwest::Proxy::all(proxy.trim())
+                        .with_context(|| format!("invalid proxy URL in {KEY_PROXY}"))?,
+                );
+            }
+            builder.build().context("cannot build the HTTP client")
         }
 
-        let http = builder.build().context("cannot build the HTTP client")?;
+        let http = build_client(proxy.clone(), false)?;
+        let http_range = build_client(proxy, true)?;
         let auth_base =
             std::env::var("PIKPAK_AUTH_BASE_URL").unwrap_or_else(|_| DEFAULT_AUTH_BASE.to_string());
         let drive_base = std::env::var("PIKPAK_DRIVE_BASE_URL")
@@ -133,6 +145,7 @@ impl PikPak {
         let config_lock_path = crate::fsutil::lock_path(&paths.env_file);
         Ok(Self {
             http,
+            http_range,
             paths,
             config: Arc::new(Mutex::new(config)),
             device_id,
@@ -152,6 +165,10 @@ impl PikPak {
 
     pub fn http(&self) -> &reqwest::Client {
         &self.http
+    }
+
+    pub fn http_range(&self) -> &reqwest::Client {
+        &self.http_range
     }
 
     pub fn device_id(&self) -> &str {
@@ -883,6 +900,7 @@ mod tests {
         let config_lock_path = crate::fsutil::lock_path(&paths.env_file);
         PikPak {
             http: reqwest::Client::new(),
+            http_range: reqwest::Client::builder().no_gzip().build().unwrap(),
             paths,
             config: Arc::new(Mutex::new(config)),
             device_id: "test-device".to_string(),

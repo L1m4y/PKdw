@@ -164,6 +164,31 @@ impl LinkSource for ShareLinkSource {
     }
 }
 
+/// Keeps one resolved URL for the whole transfer. It is used when the CDN
+/// provides no strong validator: a refreshed signed URL cannot be proven to
+/// serve the same bytes, so mixing ranges from two URLs is not allowed.
+struct PinnedLinkSource {
+    url: String,
+    representation_id: String,
+}
+
+#[async_trait]
+impl LinkSource for PinnedLinkSource {
+    async fn link_for(&self, representation_id: &str, _force_refresh: bool) -> Result<String> {
+        if !self
+            .representation_id
+            .eq_ignore_ascii_case(representation_id)
+        {
+            bail!(
+                "pinned link belongs to representation {}, not {}",
+                self.representation_id,
+                representation_id
+            );
+        }
+        Ok(self.url.clone())
+    }
+}
+
 pub struct DriveLinkSource {
     client: PikPak,
     file_id: String,
@@ -336,18 +361,29 @@ pub async fn download_file(
     let manifest_path = append_suffix(&dest, ".pkdw.manifest.json");
     let representation = media.representation_id.as_str();
 
+    // One process at a time per destination: the lock covers the .part file,
+    // the sidecar and the manifest finalization.
+    let _destination_lock = crate::fsutil::FileLock::acquire(&crate::fsutil::lock_path(&dest))?;
+
     if options.overwrite {
         remove_if_exists(&part).await?;
         remove_if_exists(&state_path).await?;
         remove_if_exists(&manifest_path).await?;
         remove_if_exists(&dest).await?;
+        remove_manifest_temps(&manifest_path)?;
     }
 
     // If the caller already knows the size, an existing destination can be
-    // verified without touching the network.
+    // verified (or its interrupted manifest finalized) without network I/O.
     if let Some(expected) = media.expected_size {
         if dest.exists()
-            && verified_destination(&dest, &manifest_path, source_id, representation, expected)?
+            && verify_or_recover_destination(
+                &dest,
+                &manifest_path,
+                source_id,
+                representation,
+                expected,
+            )?
         {
             ui::status(
                 options.quiet,
@@ -377,9 +413,20 @@ pub async fn download_file(
         }
     }
     let size = probe.size;
+    let strong_validator = probe.validators.if_range_value().is_some();
+    let source: Arc<dyn LinkSource> = if strong_validator {
+        source
+    } else {
+        // Without a strong validator, changing to another signed URL cannot
+        // prove that the representation is unchanged. Keep the probed URL.
+        Arc::new(PinnedLinkSource {
+            url: url.clone(),
+            representation_id: representation.to_string(),
+        })
+    };
 
     if dest.exists()
-        && verified_destination(&dest, &manifest_path, source_id, representation, size)?
+        && verify_or_recover_destination(&dest, &manifest_path, source_id, representation, size)?
     {
         ui::status(
             options.quiet,
@@ -424,13 +471,29 @@ pub async fn download_file(
         ui::warn("the CDN representation changed; all partial ranges will be retried");
     }
 
+    // A resumed transfer uses a freshly signed URL. Without a strong
+    // validator there is no proof that it still serves the same bytes, so the
+    // previous ranges cannot be trusted.
+    let unverifiable_resume =
+        state_existed && !state.completed.is_empty() && probe.validators.if_range_value().is_none();
+    if unverifiable_resume {
+        ui::warn(
+            "the CDN provides no strong validator for this representation; \
+             discarding previous partial ranges",
+        );
+    }
+
     // Do not trust byte ranges whose file is missing or has been truncated.
     // Persist that invalidation immediately; otherwise the next launch may
     // still believe that segments which are no longer on disk are complete.
-    if !part_existed || part_truncated || validator_changed {
+    if !part_existed || part_truncated || validator_changed || unverifiable_resume {
         state.completed.clear();
         if part_truncated {
             ui::warn("partial file is shorter than its sidecar; all segments will be retried");
+        }
+        if unverifiable_resume || !strong_validator {
+            state.etag = None;
+            state.last_modified = None;
         }
         save_state(&state_path, &state)?;
     } else if !state_existed {
@@ -596,23 +659,35 @@ pub async fn download_file(
         file.sync_all()
             .context("failed to sync completed download")?;
         drop(file);
-        if dest.exists() {
-            remove_if_exists(&dest).await?;
-        }
         let sha256 = sha256_file(&part)?;
-        tokio::fs::rename(&part, &dest)
-            .await
-            .with_context(|| format!("cannot move {} into place", part.display()))?;
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source_id": source_id,
-                "size": size,
-                "representation": representation,
-                "sha256": sha256,
-            }))?,
-        )?;
-        remove_if_exists(&state_path).await?;
+        let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+            "source_id": source_id,
+            "size": size,
+            "representation": representation,
+            "sha256": sha256,
+        }))?;
+        // Sync the manifest before committing the data file. If the process
+        // dies between both renames, the next run can verify and finish the
+        // manifest instead of requiring --overwrite.
+        let manifest_tmp = crate::fsutil::write_temp_file(&manifest_path, &manifest)?;
+        let mut manifest_committed = false;
+        let result = (|| -> Result<()> {
+            if dest.exists() {
+                std::fs::remove_file(&dest)
+                    .with_context(|| format!("cannot replace {}", dest.display()))?;
+            }
+            std::fs::rename(&part, &dest)
+                .with_context(|| format!("cannot move {} into place", part.display()))?;
+            crate::fsutil::replace_file(&manifest_tmp, &manifest_path)?;
+            manifest_committed = true;
+            crate::fsutil::sync_parent_dir(&dest)?;
+            remove_state_file(&state_path)?;
+            Ok(())
+        })();
+        if !manifest_committed {
+            let _ = std::fs::remove_file(&manifest_tmp);
+        }
+        result?;
         bar.finish_and_clear();
         ui::status(
             options.quiet,
@@ -642,7 +717,7 @@ pub async fn download_file(
     })
 }
 
-fn verified_destination(
+fn verify_or_recover_destination(
     dest: &Path,
     manifest_path: &Path,
     source_id: &str,
@@ -657,6 +732,12 @@ fn verified_destination(
             existing,
             size
         );
+    }
+
+    // A crash between the data rename and the manifest rename leaves a
+    // synced manifest temporary next to the destination.
+    if recover_manifest_temp(dest, manifest_path, source_id, representation)? {
+        return Ok(true);
     }
 
     let manifest_ok = std::fs::read_to_string(manifest_path)
@@ -681,6 +762,95 @@ fn verified_destination(
         "destination {} has the expected size but no verified manifest; use --overwrite",
         dest.display()
     )
+}
+
+fn manifest_temp_prefix(manifest_path: &Path) -> Option<String> {
+    let name = manifest_path.file_name()?.to_string_lossy();
+    Some(format!(".{name}.tmp."))
+}
+
+fn recover_manifest_temp(
+    dest: &Path,
+    manifest_path: &Path,
+    source_id: &str,
+    representation: &str,
+) -> Result<bool> {
+    let Some(prefix) = manifest_temp_prefix(manifest_path) else {
+        return Ok(false);
+    };
+    let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let dest_size = std::fs::metadata(dest)?.len();
+    let mut recovered = false;
+
+    for entry in
+        std::fs::read_dir(parent).with_context(|| format!("cannot scan {}", parent.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let manifest = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        let valid = manifest.as_ref().is_some_and(|manifest| {
+            manifest
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(source_id)
+                && manifest
+                    .get("representation")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(representation)
+                && manifest.get("size").and_then(serde_json::Value::as_u64) == Some(dest_size)
+                && manifest
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|expected| {
+                        sha256_file(dest)
+                            .map(|actual| actual == expected)
+                            .unwrap_or(false)
+                    })
+        });
+        if valid {
+            crate::fsutil::replace_file(&path, manifest_path)?;
+            crate::fsutil::sync_parent_dir(dest)?;
+            recovered = true;
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    Ok(recovered)
+}
+
+fn remove_manifest_temps(manifest_path: &Path) -> Result<()> {
+    let Some(prefix) = manifest_temp_prefix(manifest_path) else {
+        return Ok(());
+    };
+    let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot scan {}", parent.display()))
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn remove_state_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
+    }
 }
 
 #[derive(Debug)]
@@ -796,6 +966,7 @@ async fn fetch_range(
     let response = request
         .send()
         .await
+        .map_err(|error| error.without_url())
         .with_context(|| format!("range request {start}-{end} failed"))?;
 
     let status = response.status();
@@ -849,7 +1020,12 @@ async fn fetch_range(
 
     let mut stream = response.bytes_stream();
     let mut offset = start;
-    while let Some(chunk) = stream.try_next().await.context("download stream failed")? {
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|error| error.without_url())
+        .context("download stream failed")?
+    {
         if chunk.is_empty() {
             continue;
         }
@@ -875,15 +1051,9 @@ async fn fetch_range(
 
 fn validator_conflicts(expected: &str, observed: &Validators) -> bool {
     if expected.starts_with('"') || expected.starts_with("W/") {
-        observed
-            .etag
-            .as_deref()
-            .is_some_and(|etag| etag != expected)
+        observed.etag.as_deref() != Some(expected)
     } else {
-        observed
-            .last_modified
-            .as_deref()
-            .is_some_and(|modified| modified != expected)
+        observed.last_modified.as_deref() != Some(expected)
     }
 }
 
@@ -910,11 +1080,10 @@ fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
 }
 
 fn save_state(path: &Path, state: &PartState) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
     let encoded = serde_json::to_vec(state)?;
-    std::fs::write(&tmp, encoded)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // Unique temporary, fsync, atomic replace and directory sync. The sidecar
+    // can therefore never advance past durably written segment bytes.
+    crate::fsutil::atomic_write(path, &encoded)
 }
 
 async fn remove_if_exists(path: &Path) -> Result<()> {
@@ -1005,6 +1174,7 @@ async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<Pro
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
+        .map_err(|error| error.without_url())
         .context("cannot probe the CDN link")?;
 
     let status = response.status();
@@ -1066,6 +1236,7 @@ async fn probe_content_length(client: &reqwest::Client, url: &str) -> Result<Pro
     let body = response
         .bytes()
         .await
+        .map_err(|error| error.without_url())
         .context("cannot read the probe response body")?;
     if body.len() != 1 {
         return Err(anyhow!(
@@ -1150,6 +1321,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovers_a_synced_manifest_temporary_after_the_data_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("movie.mkv");
+        let manifest_path = append_suffix(&dest, ".pkdw.manifest.json");
+        std::fs::write(&dest, b"payload").unwrap();
+        let manifest = serde_json::json!({
+            "source_id": "source-1",
+            "size": 7,
+            "representation": "original",
+            "sha256": sha256_file(&dest).unwrap(),
+        });
+        let temporary = crate::fsutil::write_temp_file(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap().as_slice(),
+        )
+        .unwrap();
+
+        assert!(recover_manifest_temp(&dest, &manifest_path, "source-1", "original").unwrap());
+        assert!(!temporary.exists());
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(recovered["source_id"], "source-1");
+    }
+
+    #[test]
+    fn discards_an_unrelated_manifest_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("movie.mkv");
+        let manifest_path = append_suffix(&dest, ".pkdw.manifest.json");
+        std::fs::write(&dest, b"payload").unwrap();
+        let temporary = crate::fsutil::write_temp_file(
+            &manifest_path,
+            br#"{"source_id":"other","size":7,"representation":"original","sha256":"bad"}"#,
+        )
+        .unwrap();
+
+        assert!(!recover_manifest_temp(&dest, &manifest_path, "source-1", "original").unwrap());
+        assert!(!temporary.exists());
+        assert!(!manifest_path.exists());
+    }
+
     fn probe_client() -> reqwest::Client {
         reqwest::Client::builder().no_gzip().build().unwrap()
     }
@@ -1169,6 +1382,19 @@ mod tests {
             let _ = socket.write_all(response.as_bytes()).await;
         });
         format!("http://{address}/file?token=SECRET&sign=SECRET2")
+    }
+
+    #[tokio::test]
+    async fn probe_network_errors_never_include_the_signed_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/file?token=SECRET&sign=SECRET2");
+        let error = probe_content_length(&probe_client(), &url)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains("SECRET"), "{text}");
     }
 
     #[tokio::test]
